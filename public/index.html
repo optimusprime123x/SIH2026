@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LMPC Compliance Checker</title>
+  <script>try { document.documentElement.dataset.theme = localStorage.getItem("lmpc_theme") || "dark"; } catch (e) {}</script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@200;300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+Devanagari:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/app.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%23FF6F1F'/><rect x='3' y='7' width='10' height='2' fill='%230A2540'/></svg>" />
+</head>
+<body>
+
+  <!-- ============ LOGIN ============ -->
+  <section id="view-login" class="login-stage">
+    <div class="login-panel tile">
+      <div class="login-band">
+        <div class="brand-square"></div>
+        <p class="band-devanagari">विधिक माप विज्ञान</p>
+        <h1 class="band-title">lmpc<br />compliance<br />checker</h1>
+        <p class="band-sub">Legal Metrology (Packaged Commodities) Rules, 2011 · PS 26034</p>
+      </div>
+      <form class="login-form" id="login-form" autocomplete="off">
+        <p class="metro-label">sign in</p>
+        <label class="field-label" for="login-pass">ACCESS CODE</label>
+        <input type="password" id="login-pass" class="metro-input" placeholder="••••••••" autofocus />
+        <label class="field-label">ROLE</label>
+        <div class="segmented" id="role-seg">
+          <button type="button" class="seg-btn active" data-role="inspector">INSPECTOR</button>
+          <button type="button" class="seg-btn" data-role="admin">ADMIN</button>
+        </div>
+        <p class="login-error" id="login-error" hidden>Incorrect access code.</p>
+        <button type="submit" class="btn btn-accent btn-block">SIGN IN →</button>
+        <p class="login-foot">Prototype build · Smart India Hackathon 2026</p>
+      </form>
+    </div>
+  </section>
+
+  <!-- ============ APP SHELL ============ -->
+  <div id="app-shell" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-square small"></div>
+        <div class="brand-text">
+          <span class="brand-name">lmpc compliance checker</span>
+          <span class="brand-tag">legal metrology · rules 2011</span>
+        </div>
+      </div>
+      <nav class="pivot" id="main-nav">
+        <button class="pivot-item active" data-view="scan">new scan</button>
+        <button class="pivot-item" data-view="history">history</button>
+        <button class="pivot-item" data-view="dashboard">dashboard</button>
+      </nav>
+      <div class="topbar-right">
+        <span class="chip chip-role" id="role-chip">INSPECTOR</span>
+        <button class="icon-btn" id="theme-toggle" title="Toggle theme">◐</button>
+        <button class="icon-btn" id="logout-btn" title="Sign out">⏻</button>
+      </div>
+    </header>
+
+    <!-- ======== NEW SCAN ======== -->
+    <main id="view-scan" class="view">
+      <div class="scan-grid">
+        <div class="left-col">
+        <!-- LEFT : evidence upload -->
+        <section class="tile pane">
+          <p class="metro-label">evidence</p>
+          <h2 class="pane-title">package images</h2>
+
+          <div class="dropzone" id="dropzone" tabindex="0">
+            <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp,image/heic,image/heif" multiple hidden />
+            <div class="dz-inner">
+              <div class="dz-glyph">⇪</div>
+              <p class="dz-line">drop photos or <span class="dz-browse">browse</span></p>
+              <p class="dz-hint">up to 5 images · all sides of the same package</p>
+            </div>
+          </div>
+          <input type="file" id="camera-input" accept="image/*" capture="environment" hidden />
+          <button class="btn btn-ghost btn-block camera-btn" id="camera-btn">▣&nbsp; TAKE PHOTO WITH CAMERA</button>
+          <p class="tiny-note upload-warn" id="upload-warn" hidden></p>
+
+          <div class="thumb-grid" id="thumb-grid"></div>
+
+          <p class="tiny-note" id="barcode-support-note" hidden>Barcode decoding unavailable in this browser — scans proceed without barcode matching.</p>
+
+          <button class="btn btn-accent btn-block btn-lg" id="scan-btn" disabled>SCAN NOW ▸</button>
+          <p class="tiny-note">Images are analysed by Gemini for extraction only. Compliance verdicts come from the deterministic rules engine with clause citations.</p>
+        </section>
+
+        <!-- LEFT (below upload) : barcode / product identity -->
+        <section class="tile pane identity-pane" id="identity-pane" hidden></section>
+        </div>
+
+        <!-- RIGHT : results -->
+        <section class="tile pane results-pane" id="results-pane">
+          <div id="results-empty" class="results-empty">
+            <div class="empty-mark"></div>
+            <p class="metro-label">results</p>
+            <h2 class="pane-title">awaiting scan</h2>
+            <p class="muted">Upload package photographs and press <b>SCAN NOW</b>.<br />Extracted declarations and rule-by-rule findings appear here.</p>
+          </div>
+
+          <div id="results-loading" class="results-loading" hidden>
+            <div class="loader-bar"><span></span></div>
+            <p class="metro-label">scanning</p>
+            <h2 class="pane-title" id="loading-msg">reading label…</h2>
+            <p class="muted">Gemini is transcribing the declarations. The rules engine will validate them against the 2011 Rules.</p>
+          </div>
+
+          <div id="results-content" hidden></div>
+        </section>
+      </div>
+    </main>
+
+    <!-- ======== HISTORY ======== -->
+    <main id="view-history" class="view" hidden>
+      <section class="tile pane">
+        <div class="pane-head-row">
+          <div>
+            <p class="metro-label">repository</p>
+            <h2 class="pane-title">inspection history</h2>
+          </div>
+          <button class="btn btn-ghost" id="history-clear-btn">CLEAR ALL</button>
+        </div>
+        <div id="history-list" class="history-list"></div>
+        <div id="history-empty" class="results-empty" hidden>
+          <div class="empty-mark"></div>
+          <p class="muted">No saved inspections yet. Accepted scan verdicts are stored here (locally, for the prototype).</p>
+        </div>
+      </section>
+    </main>
+
+    <!-- ======== DASHBOARD ======== -->
+    <main id="view-dashboard" class="view" hidden>
+      <div class="dash-head">
+        <p class="metro-label">enforcement overview</p>
+        <h2 class="pane-title">compliance dashboard</h2>
+      </div>
+      <div id="dash-empty" class="tile pane results-empty" hidden>
+        <div class="empty-mark"></div>
+        <p class="muted">No saved inspections yet — the dashboard aggregates the scan repository.<br />Accept and save a few scans first.</p>
+      </div>
+      <div id="dash-content" hidden>
+        <div class="stat-row" id="stat-row"></div>
+        <div class="dash-grid">
+          <section class="tile pane">
+            <p class="metro-label">verdicts</p>
+            <h3 class="dash-tile-title">inspection outcomes</h3>
+            <div class="verdict-bar" id="verdict-bar"></div>
+            <div class="verdict-legend" id="verdict-legend"></div>
+          </section>
+          <section class="tile pane">
+            <p class="metro-label">violation hotspots</p>
+            <h3 class="dash-tile-title">most-violated provisions</h3>
+            <div id="clause-ranks"></div>
+          </section>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ============ OVERRIDE MODAL ============ -->
+  <div class="modal-scrim" id="override-modal" hidden>
+    <div class="tile modal">
+      <p class="metro-label">admin action</p>
+      <h2 class="pane-title">override verdict</h2>
+      <label class="field-label">NEW VERDICT</label>
+      <div class="segmented" id="override-seg">
+        <button type="button" class="seg-btn" data-verdict="COMPLIANT">COMPLIANT</button>
+        <button type="button" class="seg-btn" data-verdict="NON-COMPLIANT">NON-COMPLIANT</button>
+        <button type="button" class="seg-btn" data-verdict="NEEDS REVIEW">NEEDS REVIEW</button>
+      </div>
+      <label class="field-label" for="override-reason">REASON (LOGGED)</label>
+      <textarea id="override-reason" class="metro-input" rows="3" maxlength="600" placeholder="Grounds for overriding the rules-engine verdict…"></textarea>
+      <p class="login-error" id="override-error" hidden>Select a verdict and give a reason.</p>
+      <div class="btn-row">
+        <button class="btn btn-ghost" id="override-cancel">CANCEL</button>
+        <button class="btn btn-accent" id="override-apply">APPLY OVERRIDE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ HISTORY DETAIL MODAL ============ -->
+  <div class="modal-scrim" id="detail-modal" hidden>
+    <div class="tile modal modal-wide">
+      <div class="pane-head-row">
+        <div>
+          <p class="metro-label">saved inspection</p>
+          <h2 class="pane-title" id="detail-title">report</h2>
+        </div>
+        <button class="icon-btn" id="detail-close">✕</button>
+      </div>
+      <div id="detail-body"></div>
+      <div class="btn-row">
+        <button class="btn btn-ghost" id="detail-delete">DELETE</button>
+        <button class="btn btn-accent" id="detail-export">EXPORT PDF ↧</button>
+      </div>
+    </div>
+  </div>
+
+  <script defer src="/vendor/zxing-reader.iife.js"></script>
+  <script defer src="/vendor/jspdf.umd.min.js"></script>
+  <script defer src="/vendor/jspdf.plugin.autotable.min.js"></script>
+  <script defer src="/js/rules.js"></script>
+  <script defer src="/js/export.js"></script>
+  <script defer src="/js/app.js"></script>
+</body>
+</html>

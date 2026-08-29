@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lmpc-compliance-checker",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  }
+  // Later: add R2 bucket (evidence images) and D1 (scan repository) bindings here.
+  //
+  // Secrets — the worker rotates across ALL of these (any subset works):
+  //   wrangler secret put GEMINI_API_KEY1
+  //   wrangler secret put GEMINI_API_KEY2
+  //   wrangler secret put GEMINI_API_KEY3
+  // (GEMINI_API_KEY is also accepted; GEMINI_API_KEY4 is deliberately unused — depleted.)
+  // For local dev the same names go in .dev.vars.
+}
