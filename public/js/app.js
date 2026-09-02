@@ -89,6 +89,7 @@
     if (!btn) return;
     $("#main-nav").querySelectorAll(".pivot-item").forEach((b) => b.classList.toggle("active", b === btn));
     $("#view-scan").hidden = btn.dataset.view !== "scan";
+    $("#view-ecommerce").hidden = btn.dataset.view !== "ecommerce";
     $("#view-history").hidden = btn.dataset.view !== "history";
     $("#view-dashboard").hidden = btn.dataset.view !== "dashboard";
     if (btn.dataset.view === "history") renderHistory();
@@ -412,6 +413,8 @@
       title: "Barcode / product database match",
       requirement: "Barcodes/GTINs are permitted in addition to the mandatory declarations; a decoded GTIN is cross-checked against a product database.",
       extracted: null, status: "review", severity: null, manual: true, findings: [],
+      box_2d: extraction?.barcode_box_2d || null,
+      image_index: extraction?.barcode_image_index ?? null,
     };
     const gtin = barcodes.find((b) => isProductFormat(b.format) || (String(b.format).startsWith("OCR") && isValidGtin(b.value)));
     if (!gtin) {
@@ -512,6 +515,29 @@
 
   const STATUS_WORD = { pass: "COMPLIANT", violation: "VIOLATION", missing: "MISSING", review: "REVIEW", na: "N/A" };
 
+  const LABEL_TITLES = {
+    "manufacturer": "Manufacturer",
+    "origin": "Country of Origin",
+    "generic-name": "Generic Name",
+    "net-quantity": "Net Qty",
+    "mfg-date": "Mfg Date",
+    "best-before": "Best Before",
+    "mrp": "MRP",
+    "consumer-care": "Consumer Care",
+    "unit-sale-price": "USP",
+    "dimensions": "Dimensions",
+    "veg-mark": "Veg Mark",
+    "sticker": "Sticker",
+    "gm": "GM Food",
+    "barcode": "Barcode",
+  };
+
+  const evidenceState = {
+    activeImgIdx: 0,
+    filter: "all",
+    hideBoxes: false,
+  };
+
   function verdictClass(v) {
     return v === "COMPLIANT" ? "v-compliant" : v === "NON-COMPLIANT" ? "v-noncompliant" : "v-review";
   }
@@ -521,6 +547,10 @@
   function buildRuleCardHtml(r, interactive) {
     const eff = r.resolution?.status ?? r.status;
     const sevClass = r.severity ? ` sev-${r.severity}` : "";
+    const hasBox = Boolean(r.box_2d && r.box_2d.length === 4);
+    const boxBadge = hasBox
+      ? `<button type="button" class="locate-btn" data-check="${esc(r.id)}" data-img="${r.image_index ?? 0}" title="Highlight on label photo">📍 PHOTO ${(r.image_index ?? 0) + 1}</button>`
+      : "";
 
     let resolveHtml = "";
     if (r.resolution) {
@@ -538,11 +568,24 @@
         </div>`;
     }
 
+    let mathBoxHtml = "";
+    if (r.id === "unit-sale-price" && r.math) {
+      const m = r.math;
+      mathBoxHtml = `
+        <div class="rule-math-box">
+          <div class="rm-item"><small>Statutory Base</small><span>1 ${esc(m.expectedBaseUnit)}</span></div>
+          <div class="rm-item"><small>Formula</small><span>${esc(m.formula)}</span></div>
+          <div class="rm-item"><small>Calculated USP</small><span class="rm-val">₹${m.expectedPrice.toFixed(2)} / ${esc(m.expectedBaseUnit)}</span></div>
+          <div class="rm-item"><small>Rule 6(11)</small><span>${m.isExempt ? "Exempt (MRP = USP)" : "Mandatory"}</span></div>
+        </div>`;
+    }
+
     return `
-      <article class="rule-card s-${eff}${sevClass}">
+      <article class="rule-card s-${eff}${sevClass}" data-check="${esc(r.id)}" data-img="${r.image_index ?? 0}">
         <div class="rule-head">
           <span class="clause-chip">${esc(r.clause)}</span>
           <span class="rule-title">${esc(r.title)}</span>
+          ${boxBadge}
           <span class="status-word s-${eff}">${STATUS_WORD[eff]}${r.resolution ? " ✓" : ""}</span>
         </div>
         <p class="rule-req">${esc(r.requirement)}</p>
@@ -550,11 +593,215 @@
           <span class="x-label">AI EXTRACTED (VERBATIM)</span>
           <span class="x-text ${r.extracted ? "" : "none"}">${r.extracted ? esc(r.extracted) : "— not found on label —"}</span>
         </div>
+        ${mathBoxHtml}
         <ul class="rule-findings">
           ${r.findings.map((f) => `<li>${esc(f)}</li>`).join("")}
         </ul>
         ${resolveHtml}
       </article>`;
+  }
+
+  /** Visual Evidence Map with SVG Bounding Boxes */
+  function buildEvidenceMapHtml(rec) {
+    if (!rec?.thumbs?.length) return "";
+
+    const activeIdx = Math.min(evidenceState.activeImgIdx, rec.thumbs.length - 1);
+    const activeThumb = rec.thumbs[activeIdx];
+
+    const itemsOnPhoto = (rec.results || []).filter(
+      (r) => r.box_2d && r.box_2d.length === 4 && (r.image_index ?? 0) === activeIdx
+    );
+
+    const totalBoxes = (rec.results || []).filter((r) => r.box_2d && r.box_2d.length === 4).length;
+    if (!totalBoxes) return "";
+
+    const filteredBoxes = itemsOnPhoto.filter((r) => {
+      const eff = r.resolution?.status ?? r.status;
+      if (evidenceState.filter === "violation") return ["violation", "missing"].includes(eff);
+      if (evidenceState.filter === "pass") return eff === "pass";
+      if (evidenceState.filter === "review") return eff === "review";
+      return true;
+    });
+
+    const boxesSvg = filteredBoxes
+      .map((r) => {
+        const [ymin, xmin, ymax, xmax] = r.box_2d;
+        const w = Math.max(14, xmax - xmin);
+        const h = Math.max(14, ymax - ymin);
+        const eff = r.resolution?.status ?? r.status;
+        const label = LABEL_TITLES[r.id] || r.clause || r.title;
+        const tagW = Math.max(48, label.length * 7.5 + 14);
+        const tagY = ymin >= 24 ? ymin - 22 : ymin + 3;
+        return `
+          <g class="evidence-box-group s-${eff}" data-check="${esc(r.id)}" data-title="${esc(r.title)}" data-clause="${esc(r.clause)}" data-extracted="${esc(r.extracted || '')}" data-status="${STATUS_WORD[eff] || eff.toUpperCase()}" tabindex="0">
+            <rect class="box-rect" x="${xmin}" y="${ymin}" width="${w}" height="${h}" rx="6" ry="6" />
+            <g class="box-tag" transform="translate(${xmin}, ${tagY})">
+              <rect class="box-tag-bg" width="${tagW}" height="20" rx="3" ry="3" />
+              <text class="box-tag-text" x="6" y="14">${esc(label)}</text>
+            </g>
+          </g>`;
+      })
+      .join("");
+
+    const tabsHtml = rec.thumbs.length > 1
+      ? `<div class="evidence-tabs" id="ev-tabs">
+          ${rec.thumbs
+            .map((_, idx) => {
+              const count = rec.results.filter((r) => r.box_2d && (r.image_index ?? 0) === idx).length;
+              return `<button type="button" class="evidence-tab ${idx === activeIdx ? "active" : ""}" data-idx="${idx}">PHOTO ${idx + 1} (${count})</button>`;
+            })
+            .join("")}
+        </div>`
+      : `<span class="metro-label" style="margin:0;">evidence photo 1</span>`;
+
+    const chipsHtml = itemsOnPhoto.length
+      ? itemsOnPhoto
+          .map((r) => {
+            const eff = r.resolution?.status ?? r.status;
+            const label = LABEL_TITLES[r.id] || r.title;
+            return `<button type="button" class="ev-chip s-${eff}" data-check="${esc(r.id)}"><span class="chip-dot"></span>${esc(label)}</button>`;
+          })
+          .join("")
+      : `<span class="tiny-note" style="margin:0;">No declarations located on this image.</span>`;
+
+    return `
+      <section class="evidence-map-tile tile" id="evidence-map-tile">
+        <div class="evidence-map-head">
+          <div class="evidence-map-title">
+            <p class="metro-label" style="margin-bottom:2px;">visual evidence overlay</p>
+            <h3>Declaration Locator (box_2d)</h3>
+          </div>
+          <div class="evidence-controls">
+            ${tabsHtml}
+            <button type="button" class="box-filter-btn ${evidenceState.filter === "all" ? "active" : ""}" data-filter="all">ALL</button>
+            <button type="button" class="box-filter-btn ${evidenceState.filter === "violation" ? "active" : ""}" data-filter="violation">VIOLATIONS</button>
+            <button type="button" class="toggle-overlay-btn" id="ev-toggle-boxes">${evidenceState.hideBoxes ? "SHOW BOXES" : "HIDE BOXES"}</button>
+          </div>
+        </div>
+
+        <div class="evidence-viewport">
+          <div class="evidence-stage" id="ev-stage" data-idx="${activeIdx}">
+            <img class="evidence-img" id="ev-img" src="${activeThumb}" alt="Evidence photo ${activeIdx + 1}" />
+            <svg class="evidence-svg ${evidenceState.hideBoxes ? "boxes-hidden" : ""}" id="ev-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none">
+              ${boxesSvg}
+            </svg>
+            <div class="evidence-tooltip-popup" id="ev-tooltip" hidden></div>
+          </div>
+        </div>
+
+        <div class="evidence-footer">
+          <div class="evidence-chips" id="ev-chips">${chipsHtml}</div>
+          <small class="muted" style="font-family:var(--font-mono);font-size:10.5px;">Click any box to inspect legal clause</small>
+        </div>
+      </section>`;
+  }
+
+  function bindEvidenceMap(container, rec) {
+    if (!container || !rec) return;
+
+    // Photo Tab switching
+    container.querySelectorAll(".evidence-tab").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        evidenceState.activeImgIdx = Number(btn.dataset.idx);
+        renderResults();
+      });
+    });
+
+    // Filter switching
+    container.querySelectorAll(".box-filter-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        evidenceState.filter = btn.dataset.filter;
+        renderResults();
+      });
+    });
+
+    // Toggle boxes on/off
+    container.querySelector("#ev-toggle-boxes")?.addEventListener("click", () => {
+      evidenceState.hideBoxes = !evidenceState.hideBoxes;
+      const svg = container.querySelector("#ev-svg");
+      if (svg) svg.classList.toggle("boxes-hidden", evidenceState.hideBoxes);
+      const btn = container.querySelector("#ev-toggle-boxes");
+      if (btn) btn.textContent = evidenceState.hideBoxes ? "SHOW BOXES" : "HIDE BOXES";
+    });
+
+    // Tooltip & Box hover / click interaction
+    const tooltip = container.querySelector("#ev-tooltip");
+    container.querySelectorAll(".evidence-box-group").forEach((group) => {
+      const checkId = group.dataset.check;
+      const clause = group.dataset.clause;
+      const title = group.dataset.title;
+      const status = group.dataset.status;
+      const extracted = group.dataset.extracted;
+
+      group.addEventListener("mouseenter", () => {
+        if (tooltip) {
+          tooltip.hidden = false;
+          tooltip.innerHTML = `
+            <div class="tip-clause">${esc(clause)} · ${esc(status)}</div>
+            <div class="tip-title"><b>${esc(title)}</b></div>
+            ${extracted ? `<div class="tip-extract">${esc(extracted)}</div>` : ""}`;
+        }
+        document.querySelectorAll(`.rule-card[data-check="${checkId}"]`).forEach((c) => c.classList.add("highlighted-card"));
+      });
+
+      group.addEventListener("mouseleave", () => {
+        if (tooltip) tooltip.hidden = true;
+        document.querySelectorAll(`.rule-card[data-check="${checkId}"]`).forEach((c) => c.classList.remove("highlighted-card"));
+      });
+
+      group.addEventListener("click", () => {
+        const card = document.querySelector(`.rule-card[data-check="${checkId}"]`);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "center" });
+          card.classList.add("pulse-highlight");
+          setTimeout(() => card.classList.remove("pulse-highlight"), 1500);
+        }
+      });
+    });
+
+    // Chip click in footer
+    container.querySelectorAll(".ev-chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        const checkId = chip.dataset.check;
+        const box = container.querySelector(`.evidence-box-group[data-check="${checkId}"]`);
+        if (box) {
+          box.classList.add("active-box");
+          setTimeout(() => box.classList.remove("active-box"), 1600);
+        }
+        const card = document.querySelector(`.rule-card[data-check="${checkId}"]`);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "center" });
+          card.classList.add("pulse-highlight");
+          setTimeout(() => card.classList.remove("pulse-highlight"), 1500);
+        }
+      });
+    });
+
+    // Rule card locate-btn and card hover
+    container.querySelectorAll(".locate-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const checkId = btn.dataset.check;
+        const targetImg = Number(btn.dataset.img || 0);
+        if (evidenceState.activeImgIdx !== targetImg) {
+          evidenceState.activeImgIdx = targetImg;
+          renderResults();
+          setTimeout(() => highlightBox(checkId), 100);
+        } else {
+          highlightBox(checkId);
+        }
+      });
+    });
+
+    function highlightBox(checkId) {
+      const tile = container.querySelector("#evidence-map-tile");
+      if (tile) tile.scrollIntoView({ behavior: "smooth", block: "start" });
+      const box = container.querySelector(`.evidence-box-group[data-check="${checkId}"]`);
+      if (box) {
+        box.classList.add("active-box");
+        setTimeout(() => box.classList.remove("active-box"), 2000);
+      }
+    }
   }
 
   /** Shared HTML builder used by the live results pane (interactive: review
@@ -601,6 +848,9 @@
         <div class="ps-item"><small>Engine</small><span>${esc(rec.mock ? "mock" : rec.model)}</span></div>
       </div>`;
 
+    // Evidence Map Overlay with box_2d
+    html += buildEvidenceMapHtml(rec);
+
     // group cards (live pane: the barcode card lives in its own left tile)
     const groups = [];
     const listed = interactive ? rec.results.filter((r) => r.id !== "barcode") : rec.results;
@@ -630,10 +880,12 @@
 
     const rec = state.current;
     const retryLeft = MAX_ATTEMPTS - state.attempts;
+    const hasViolations = Boolean(rec?.verdict?.counts?.violation || rec?.verdict?.counts?.missing || rec?.verdict?.verdict === "NON-COMPLIANT");
     const toolbar = `
       <div class="results-toolbar">
         <button class="btn btn-navy" id="retry-btn" ${retryLeft <= 0 || rec.saved ? "disabled" : ""}>RETRY (${Math.max(retryLeft, 0)} LEFT)</button>
         <button class="btn btn-green" id="save-btn" ${rec.saved ? "disabled" : ""}>${rec.saved ? "SAVED ✓" : "ACCEPT VERDICT & SAVE"}</button>
+        ${hasViolations ? `<button class="btn btn-saffron" id="seizure-btn">SEIZURE MEMO ⚖️</button>` : ""}
         ${state.role === "admin" ? `<button class="btn btn-ghost" id="override-btn">OVERRIDE VERDICT</button>` : ""}
         <button class="btn btn-ghost" id="export-btn">EXPORT PDF ↧</button>
         <button class="btn btn-ghost" id="clear-btn">CLEAR</button>
@@ -643,6 +895,7 @@
     el.innerHTML = toolbar + buildResultsBody(rec, true);
     renderIdentityPane(rec);
     bindToolbar();
+    bindEvidenceMap(el, rec);
   }
 
   // Inspector resolution of review items — delegated because the results pane
@@ -683,6 +936,7 @@
     $("#clear-btn")?.addEventListener("click", clearScan);
     $("#save-btn")?.addEventListener("click", saveScan);
     $("#override-btn")?.addEventListener("click", openOverride);
+    $("#seizure-btn")?.addEventListener("click", () => openSeizureModal(state.current));
     $("#export-btn")?.addEventListener("click", () => {
       if (state.current) window.LMPCExport.exportPdf(state.current);
     });
@@ -914,17 +1168,25 @@
     state.detailId = id;
     $("#detail-title").textContent = rec.id;
     $("#detail-title").style.textTransform = "none";
-    $("#detail-body").innerHTML =
-      (rec.thumbs?.length
-        ? `<div class="detail-images">${rec.thumbs.map((t) => `<img src="${t}" alt="evidence" />`).join("")}</div>`
-        : "") +
-      buildResultsBody(rec) +
-      (state.role === "admin"
-        ? `<div class="results-toolbar"><button class="btn btn-ghost" id="detail-override-btn">OVERRIDE VERDICT</button></div>`
-        : "");
-    $("#detail-override-btn")?.addEventListener("click", () => openOverride(id));
+    $("#detail-body").innerHTML = buildResultsBody(rec, false);
+    bindEvidenceMap($("#detail-body"), rec);
+
+    const hasViolations = Boolean(rec?.verdict?.counts?.violation || rec?.verdict?.counts?.missing || rec?.verdict?.verdict === "NON-COMPLIANT");
+    const szBtn = $("#detail-seizure-btn");
+    if (szBtn) szBtn.hidden = !hasViolations;
+    const ovBtn = $("#detail-override-btn");
+    if (ovBtn) ovBtn.hidden = (state.role !== "admin");
+
     $("#detail-modal").hidden = false;
   }
+
+  $("#detail-seizure-btn")?.addEventListener("click", () => {
+    const rec = loadScans().find((s) => s.id === state.detailId);
+    if (rec) openSeizureModal(rec);
+  });
+  $("#detail-override-btn")?.addEventListener("click", () => {
+    if (state.detailId) openOverride(state.detailId);
+  });
 
   $("#detail-close").addEventListener("click", () => { $("#detail-modal").hidden = true; state.detailId = null; });
   $("#detail-export").addEventListener("click", () => {
@@ -941,15 +1203,258 @@
     if (state.current?.id === deletedId) { state.current.saved = false; renderResults(); }
   });
 
+  // ============================== seizure notice modal ==============================
+
+  let seizureTargetRecord = null;
+
+  function openSeizureModal(rec) {
+    if (!rec) return;
+    seizureTargetRecord = rec;
+    const ext = rec.extraction || {};
+    const p = ext.product || {};
+    const d = ext.declarations || {};
+
+    const mfgText = d.manufacturer?.text || d.packer?.text || d.importer?.text || "";
+    $("#sz-premises").value = mfgText || (p.brand_name ? `M/s ${p.brand_name} Retail Outlet, Main Market` : "Commercial / Retail Premises");
+    $("#sz-person").value = "Shri Store In-Charge / Manager";
+    $("#sz-gstin").value = "";
+    $("#sz-seized-qty").value = "";
+    $("#sz-sample-qty").value = "";
+    $("#sz-offence-type").value = d.sticker_over_declaration?.present ? "sticker" : "first";
+    $("#sz-notice-period").value = "15";
+    $("#sz-witness1").value = "Amit Verma, Local Resident / Merchant";
+    $("#sz-witness2").value = "Sunil Patil, Local Resident / Merchant";
+    $("#sz-officer").value = `Inspector ${(state.role || "inspector").toUpperCase()}, Legal Metrology`;
+    $("#sz-circle").value = "Flying Squad / Central Enforcement Circle";
+
+    $("#seizure-error").hidden = true;
+    $("#seizure-modal").hidden = false;
+  }
+
+  $("#seizure-close")?.addEventListener("click", () => { $("#seizure-modal").hidden = true; seizureTargetRecord = null; });
+  $("#seizure-cancel")?.addEventListener("click", () => { $("#seizure-modal").hidden = true; seizureTargetRecord = null; });
+
+  $("#seizure-form")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (!seizureTargetRecord) return;
+
+    const premises = $("#sz-premises").value.trim();
+    const person = $("#sz-person").value.trim();
+    const seizedQtyRaw = $("#sz-seized-qty").value.trim();
+    const sampleQtyRaw = $("#sz-sample-qty").value.trim();
+    const witness1 = $("#sz-witness1").value.trim();
+    const witness2 = $("#sz-witness2").value.trim();
+    const officer = $("#sz-officer").value.trim();
+    const circle = $("#sz-circle").value.trim();
+
+    if (!premises || !person || !seizedQtyRaw || isNaN(Number(seizedQtyRaw)) || Number(seizedQtyRaw) <= 0 || !witness1 || !witness2 || !officer || !circle) {
+      $("#seizure-error").hidden = false;
+      return;
+    }
+
+    const formData = {
+      premises,
+      person,
+      gstin: $("#sz-gstin").value.trim(),
+      seizedQty: `${seizedQtyRaw} package(s) seized and sealed under Form IV`,
+      sampleQty: sampleQtyRaw && Number(sampleQtyRaw) > 0 ? `${sampleQtyRaw} package(s) drawn for calibration under Rule 24` : "Nil (No samples drawn)",
+      offenceType: $("#sz-offence-type").value,
+      noticePeriod: $("#sz-notice-period").value,
+      witness1,
+      witness2,
+      officer,
+      circle,
+    };
+
+    window.LMPCExport.exportSeizureNotice(seizureTargetRecord, formData);
+    $("#seizure-modal").hidden = true;
+  });
+
+  // ============================== e-commerce audit (rule 6(10)) ==============================
+
+  let currentEcomAudit = null;
+
+  $("#ecom-paste-btn")?.addEventListener("click", async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        $("#ecom-url-input").value = text.trim();
+        triggerEcomAudit();
+      }
+    } catch {
+      $("#ecom-url-input").focus();
+    }
+  });
+
+  document.querySelectorAll(".ecom-chip-btn").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      const demo = chip.dataset.demo;
+      triggerEcomAudit(demo);
+    });
+  });
+
+  $("#ecom-audit-btn")?.addEventListener("click", () => triggerEcomAudit());
+  $("#ecom-url-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") triggerEcomAudit();
+  });
+
+  async function triggerEcomAudit(demoKey) {
+    const urlInput = $("#ecom-url-input");
+    const rawUrl = urlInput.value.trim();
+
+    if (!demoKey && !rawUrl) {
+      alert("Please paste an e-commerce product listing URL or select one of the quick test demos.");
+      urlInput.focus();
+      return;
+    }
+
+    $("#ecom-empty").hidden = true;
+    $("#ecom-results").hidden = true;
+    $("#ecom-loading").hidden = false;
+    $("#ecom-loading-text").textContent = demoKey
+      ? `Fetching verified ${demoKey.toUpperCase()} listing dataset...`
+      : "Connecting to marketplace, scraping product page and evaluating Rule 6(10)...";
+
+    try {
+      const res = await fetch("/api/audit-url", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-lmpc-auth": PASSWORD,
+        },
+        body: JSON.stringify({ url: rawUrl, demo: demoKey }),
+      });
+
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        throw new Error(json.error || "Failed to audit listing.");
+      }
+
+      if (json.data?.url) urlInput.value = json.data.url;
+      renderEcomResults(json.data);
+    } catch (err) {
+      $("#ecom-loading").hidden = true;
+      $("#ecom-empty").hidden = false;
+      alert(`Audit failed: ${err.message}`);
+    }
+  }
+
+  function renderEcomResults(data) {
+    currentEcomAudit = data;
+    const isCompliant = data.verdict === "COMPLIANT";
+    const statusClass = isCompliant ? "s-pass" : "s-violation";
+
+    let specsHtml = "";
+    if (data.specifications && Object.keys(data.specifications).length) {
+      specsHtml = `<table class="ecom-spec-table">` +
+        Object.entries(data.specifications).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("") +
+        `</table>`;
+    }
+
+    let checksHtml = "";
+    for (const c of (data.checks || [])) {
+      const isPass = c.status === "pass";
+      checksHtml += `
+        <div class="ecom-check-card ${isPass ? "c-pass" : "c-viol"}">
+          <div class="ecom-check-head">
+            <span class="ecom-check-status">${isPass ? "✓ COMPLIANT" : "✕ VIOLATION"}</span>
+            <span class="ecom-check-clause">${esc(c.clause)}</span>
+          </div>
+          <h4 class="ecom-check-title">${esc(c.title)}</h4>
+          <p class="ecom-check-extracted"><strong>Found on listing:</strong> <code>${esc(c.extracted || "—")}</code></p>
+          <p class="ecom-check-finding">${esc(c.finding)}</p>
+        </div>`;
+    }
+
+    const html = `
+      <div class="ecom-results-grid">
+        <!-- LEFT: SCRAPED LISTING PREVIEW -->
+        <div class="ecom-col-preview tile">
+          <div class="ecom-col-head">
+            <span class="metro-label">scraped listing preview</span>
+            <span class="ecom-platform-badge">${esc(data.platform || "Marketplace")}</span>
+          </div>
+          <div class="ecom-product-card">
+            <div class="ecom-img-wrap">
+              <img src="${esc(data.image || "")}" alt="${esc(data.title)}" class="ecom-main-img" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'200\\' height=\\'200\\' viewBox=\\'0 0 200 200\\'><rect fill=\\'%23112233\\' width=\\'200\\' height=\\'200\\'/><text fill=\\'%2399aabb\\' x=\\'50%\\' y=\\'50%\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>No Image</text></svg>'"/>
+            </div>
+            <div class="ecom-prod-meta">
+              <h3 class="ecom-prod-title">${esc(data.title)}</h3>
+              <div class="ecom-pricing-row">
+                <span class="ecom-price">${esc(data.price || "—")}</span>
+                <span class="ecom-qty-tag">${esc(data.net_quantity || "Pack")}</span>
+              </div>
+              <div class="ecom-seller-tag">Seller: <strong>${esc(data.seller || "Marketplace Merchant")}</strong></div>
+              <div class="ecom-url-tag"><a href="${esc(data.url)}" target="_blank" rel="noopener">Open Original Listing ↗</a></div>
+            </div>
+          </div>
+          <div class="ecom-specs-section">
+            <p class="metro-label">scraped specification table</p>
+            ${specsHtml}
+          </div>
+        </div>
+
+        <!-- RIGHT: RULE 6(10) SCORECARD & ACTIONS -->
+        <div class="ecom-col-audit tile">
+          <div class="ecom-col-head">
+            <span class="metro-label">statutory compliance scorecard</span>
+            <span class="ecom-score-badge">${data.score?.passed ?? 0} / ${data.score?.total ?? 7} Compliant</span>
+          </div>
+
+          <div class="ecom-verdict-banner ${statusClass}">
+            <div class="ecom-vb-icon">${isCompliant ? "✓" : "⚠️"}</div>
+            <div class="ecom-vb-text">
+              <h3>${isCompliant ? "COMPLIANT DIGITAL LISTING" : "NON-COMPLIANT DIGITAL LISTING"}</h3>
+              <p>${isCompliant ? "All mandatory pre-purchase declarations are present under Rule 6(10)." : `${data.score?.violations || "Multiple"} statutory contravention(s) detected under Rule 6(10).`}</p>
+            </div>
+          </div>
+
+          <div class="ecom-actions-bar">
+            <button class="btn btn-accent" id="ecom-export-pdf">EXPORT AUDIT REPORT (PDF) ↧</button>
+            ${!isCompliant ? `<button class="btn btn-saffron" id="ecom-notice-btn">GENERATE MARKETPLACE NOTICE ⚖️</button>` : ""}
+            <button class="btn btn-ghost" id="ecom-reset-btn">AUDIT ANOTHER</button>
+          </div>
+
+          <div class="ecom-checks-list">
+            ${checksHtml}
+          </div>
+        </div>
+      </div>`;
+
+    $("#ecom-results").innerHTML = html;
+    $("#ecom-results").hidden = false;
+    $("#ecom-loading").hidden = true;
+    $("#ecom-empty").hidden = true;
+
+    $("#ecom-export-pdf")?.addEventListener("click", () => {
+      if (currentEcomAudit) window.LMPCExport.exportEcomAuditPdf(currentEcomAudit);
+    });
+    $("#ecom-notice-btn")?.addEventListener("click", () => {
+      if (currentEcomAudit) window.LMPCExport.exportEcomNoticePdf(currentEcomAudit);
+    });
+    $("#ecom-reset-btn")?.addEventListener("click", () => {
+      $("#ecom-results").hidden = true;
+      $("#ecom-results").innerHTML = "";
+      $("#ecom-empty").hidden = false;
+      $("#ecom-url-input").value = "";
+      $("#ecom-url-input").focus();
+    });
+  }
+
   // close modals on scrim click or Escape
-  for (const id of ["override-modal", "detail-modal"]) {
+  for (const id of ["override-modal", "detail-modal", "seizure-modal"]) {
     $("#" + id).addEventListener("click", (e) => {
-      if (e.target.id === id) $("#" + id).hidden = true;
+      if (e.target.id === id) {
+        $("#" + id).hidden = true;
+        if (id === "detail-modal") state.detailId = null;
+        if (id === "seizure-modal") seizureTargetRecord = null;
+      }
     });
   }
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    if (!$("#override-modal").hidden) $("#override-modal").hidden = true;
+    if (!$("#seizure-modal").hidden) { $("#seizure-modal").hidden = true; seizureTargetRecord = null; }
+    else if (!$("#override-modal").hidden) $("#override-modal").hidden = true;
     else if (!$("#detail-modal").hidden) { $("#detail-modal").hidden = true; state.detailId = null; }
   });
 })();

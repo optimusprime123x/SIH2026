@@ -50,6 +50,7 @@
       </div>
       <nav class="pivot" id="main-nav">
         <button class="pivot-item active" data-view="scan">new scan</button>
+        <button class="pivot-item" data-view="ecommerce">e-commerce audit 🛒</button>
         <button class="pivot-item" data-view="history">history</button>
         <button class="pivot-item" data-view="dashboard">dashboard</button>
       </nav>
@@ -112,6 +113,62 @@
           <div id="results-content" hidden></div>
         </section>
       </div>
+    </main>
+
+    <!-- ======== E-COMMERCE URL AUDIT (RULE 6(10)) ======== -->
+    <main id="view-ecommerce" class="view" hidden>
+      <section class="tile pane">
+        <div class="pane-head-row">
+          <div>
+            <p class="metro-label">marketplace surveillance · rule 6(10)</p>
+            <h2 class="pane-title">e-commerce listing audit</h2>
+          </div>
+          <span class="chip chip-saffron">LMPC RULE 6(10)</span>
+        </div>
+
+        <p class="section-desc">
+          Audit digital product pages on Amazon.in, Blinkit, Flipkart, Zepto, BigBasket & more for mandatory pre-purchase statutory declarations under Rule 6(10) of the Legal Metrology (Packaged Commodities) Rules, 2011.
+        </p>
+
+        <!-- Search / URL Input Box -->
+        <div class="ecom-search-box">
+          <div class="ecom-input-wrapper">
+            <span class="ecom-input-icon">🔗</span>
+            <input
+              type="url"
+              id="ecom-url-input"
+              class="metro-input ecom-input"
+              placeholder="Paste product listing URL (e.g. Amazon, Blinkit, Flipkart, Zepto product link)..."
+            />
+            <button type="button" class="btn btn-ghost ecom-paste-btn" id="ecom-paste-btn" title="Paste from clipboard">📋 PASTE</button>
+            <button type="button" class="btn btn-accent ecom-audit-btn" id="ecom-audit-btn">AUDIT LISTING →</button>
+          </div>
+
+          <!-- Quick Marketplace Demo Chips -->
+          <div class="ecom-quick-chips">
+            <span class="chips-label">QUICK TEST DEMOS:</span>
+            <button type="button" class="ecom-chip-btn" data-demo="amazon">🛒 Amazon.in (Basmati Rice 5kg)</button>
+            <button type="button" class="ecom-chip-btn" data-demo="blinkit">⚡ Blinkit (Almond Milk 1L)</button>
+            <button type="button" class="ecom-chip-btn" data-demo="flipkart">🛍️ Flipkart (CTC Tea 1kg)</button>
+            <button type="button" class="ecom-chip-btn" data-demo="zepto">🚀 Zepto (Coconut Oil 500ml)</button>
+          </div>
+        </div>
+
+        <!-- Audit Loading State -->
+        <div id="ecom-loading" class="ecom-loading-state" hidden>
+          <div class="progress-bar-indet"></div>
+          <p class="loading-label" id="ecom-loading-text">Connecting to marketplace and scraping product listing...</p>
+        </div>
+
+        <!-- Empty State -->
+        <div id="ecom-empty" class="results-empty">
+          <div class="empty-mark"></div>
+          <p class="muted">Paste an online product link above or select a sample listing to run an automated Rule 6(10) compliance check.</p>
+        </div>
+
+        <!-- Audit Results Workspace -->
+        <div id="ecom-results" class="ecom-results-workspace" hidden></div>
+      </section>
     </main>
 
     <!-- ======== HISTORY ======== -->
@@ -195,8 +252,99 @@
       <div id="detail-body"></div>
       <div class="btn-row">
         <button class="btn btn-ghost" id="detail-delete">DELETE</button>
+        <button class="btn btn-saffron" id="detail-seizure-btn" hidden>SEIZURE MEMO ⚖️</button>
+        <button class="btn btn-ghost" id="detail-override-btn" hidden>OVERRIDE VERDICT</button>
         <button class="btn btn-accent" id="detail-export">EXPORT PDF ↧</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ============ LEGAL SEIZURE & COMPOUNDING NOTICE MODAL ============ -->
+  <div class="modal-scrim" id="seizure-modal" hidden>
+    <div class="tile modal modal-wide">
+      <div class="pane-head-row">
+        <div>
+          <p class="metro-label">enforcement action · form iv (sec. 15)</p>
+          <h2 class="pane-title">generate legal seizure notice & panchnama</h2>
+        </div>
+        <button class="icon-btn" id="seizure-close">✕</button>
+      </div>
+
+      <form id="seizure-form" class="seizure-form">
+        <div class="form-grid">
+          <div class="form-group full-width">
+            <label class="field-label" for="sz-premises">INSPECTED PREMISES / DEALER / PACKER NAME & ADDRESS *</label>
+            <input type="text" id="sz-premises" class="metro-input" required placeholder="e.g. M/s Reliance Retail Ltd., Shop 12, MG Road, Pune, Maharashtra - 411001" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-person">REPRESENTATIVE / PROPRIETOR PRESENT *</label>
+            <input type="text" id="sz-person" class="metro-input" required placeholder="e.g. Shri Rajesh Sharma (Store Manager)" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-gstin">GSTIN / TRADE REGISTRATION NO. (OPTIONAL)</label>
+            <input type="text" id="sz-gstin" class="metro-input" placeholder="e.g. 27AAAAA0000A1Z5" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-seized-qty">SEIZED & SEALED QUANTITY (NUMBER OF PACKAGES) *</label>
+            <input type="number" id="sz-seized-qty" class="metro-input" required min="1" step="1" placeholder="Enter number of seized packages (e.g. 10)" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-sample-qty">NUMBER OF SAMPLES DRAWN (RULE 24)</label>
+            <input type="number" id="sz-sample-qty" class="metro-input" min="0" step="1" placeholder="Enter number of sample packages drawn (e.g. 2, or leave blank if 0)" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-offence-type">OFFENCE CLASSIFICATION & STATUTORY COMPOUNDING *</label>
+            <select id="sz-offence-type" class="metro-input select-input">
+              <option value="first">1st Offence — Non-Standard Package (Sec. 36(1)): Max fine ₹25,000</option>
+              <option value="second">2nd Offence — Non-Standard Package (Sec. 36(1)): Max fine ₹50,000</option>
+              <option value="subsequent">Subsequent Offence — Up to ₹1,00,000 / Prosecution (Sec. 36(1))</option>
+              <option value="sticker">Alteration / Sticker over MRP (Sec. 36(2)): Compounding ₹50,000</option>
+              <option value="short_weight">Short-Weight / Quantity Discrepancy (Sec. 30): Max fine ₹10,000</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-notice-period">SHOW-CAUSE NOTICE RESPONSE PERIOD *</label>
+            <select id="sz-notice-period" class="metro-input select-input">
+              <option value="15">15 Days (Standard Statutory Notice under Section 48)</option>
+              <option value="7">7 Days (Urgent / Perishable Commodities)</option>
+              <option value="30">30 Days (Extended Multi-State Corporate Entity)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-witness1">INDEPENDENT WITNESS 1 (PANCHAN) *</label>
+            <input type="text" id="sz-witness1" class="metro-input" required placeholder="Name, Address & Phone (e.g. Amit Verma, Pune - 9823000000)" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-witness2">INDEPENDENT WITNESS 2 (PANCHAN) *</label>
+            <input type="text" id="sz-witness2" class="metro-input" required placeholder="Name, Address & Phone (e.g. Sunil Patil, Pune - 9822000000)" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-officer">INSPECTING OFFICER NAME & DESIGNATION *</label>
+            <input type="text" id="sz-officer" class="metro-input" required placeholder="e.g. Inspector S. K. Pathak, Legal Metrology" />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="sz-circle">ENFORCEMENT CIRCLE / JURISDICTION *</label>
+            <input type="text" id="sz-circle" class="metro-input" required placeholder="e.g. Flying Squad / Circle-II, District Enforcement Office" />
+          </div>
+        </div>
+
+        <p class="login-error" id="seizure-error" hidden>Please fill in all mandatory fields marked with an asterisk (*).</p>
+
+        <div class="btn-row" style="margin-top: 18px;">
+          <button type="button" class="btn btn-ghost" id="seizure-cancel">CANCEL</button>
+          <button type="submit" class="btn btn-accent-seizure" id="seizure-download-btn">DOWNLOAD COURT-READY NOTICE (PDF) ⚖️</button>
+        </div>
+      </form>
     </div>
   </div>
 
