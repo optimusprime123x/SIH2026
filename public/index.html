@@ -50,7 +50,6 @@
       </div>
       <nav class="pivot" id="main-nav">
         <button class="pivot-item active" data-view="scan">new scan</button>
-        <button class="pivot-item" data-view="ecommerce">e-commerce audit 🛒</button>
         <button class="pivot-item" data-view="history">history</button>
         <button class="pivot-item" data-view="dashboard">dashboard</button>
       </nav>
@@ -113,62 +112,6 @@
           <div id="results-content" hidden></div>
         </section>
       </div>
-    </main>
-
-    <!-- ======== E-COMMERCE URL AUDIT (RULE 6(10)) ======== -->
-    <main id="view-ecommerce" class="view" hidden>
-      <section class="tile pane">
-        <div class="pane-head-row">
-          <div>
-            <p class="metro-label">marketplace surveillance · rule 6(10)</p>
-            <h2 class="pane-title">e-commerce listing audit</h2>
-          </div>
-          <span class="chip chip-saffron">LMPC RULE 6(10)</span>
-        </div>
-
-        <p class="section-desc">
-          Audit digital product pages on Amazon.in, Blinkit, Flipkart, Zepto, BigBasket & more for mandatory pre-purchase statutory declarations under Rule 6(10) of the Legal Metrology (Packaged Commodities) Rules, 2011.
-        </p>
-
-        <!-- Search / URL Input Box -->
-        <div class="ecom-search-box">
-          <div class="ecom-input-wrapper">
-            <span class="ecom-input-icon">🔗</span>
-            <input
-              type="url"
-              id="ecom-url-input"
-              class="metro-input ecom-input"
-              placeholder="Paste product listing URL (e.g. Amazon, Blinkit, Flipkart, Zepto product link)..."
-            />
-            <button type="button" class="btn btn-ghost ecom-paste-btn" id="ecom-paste-btn" title="Paste from clipboard">📋 PASTE</button>
-            <button type="button" class="btn btn-accent ecom-audit-btn" id="ecom-audit-btn">AUDIT LISTING →</button>
-          </div>
-
-          <!-- Quick Marketplace Demo Chips -->
-          <div class="ecom-quick-chips">
-            <span class="chips-label">QUICK TEST DEMOS:</span>
-            <button type="button" class="ecom-chip-btn" data-demo="amazon">🛒 Amazon.in (Basmati Rice 5kg)</button>
-            <button type="button" class="ecom-chip-btn" data-demo="blinkit">⚡ Blinkit (Almond Milk 1L)</button>
-            <button type="button" class="ecom-chip-btn" data-demo="flipkart">🛍️ Flipkart (CTC Tea 1kg)</button>
-            <button type="button" class="ecom-chip-btn" data-demo="zepto">🚀 Zepto (Coconut Oil 500ml)</button>
-          </div>
-        </div>
-
-        <!-- Audit Loading State -->
-        <div id="ecom-loading" class="ecom-loading-state" hidden>
-          <div class="progress-bar-indet"></div>
-          <p class="loading-label" id="ecom-loading-text">Connecting to marketplace and scraping product listing...</p>
-        </div>
-
-        <!-- Empty State -->
-        <div id="ecom-empty" class="results-empty">
-          <div class="empty-mark"></div>
-          <p class="muted">Paste an online product link above or select a sample listing to run an automated Rule 6(10) compliance check.</p>
-        </div>
-
-        <!-- Audit Results Workspace -->
-        <div id="ecom-results" class="ecom-results-workspace" hidden></div>
-      </section>
     </main>
 
     <!-- ======== HISTORY ======== -->
@@ -293,7 +236,7 @@
           </div>
 
           <div class="form-group">
-            <label class="field-label" for="sz-sample-qty">NUMBER OF SAMPLES DRAWN (RULE 24)</label>
+            <label class="field-label" for="sz-sample-qty">NUMBER OF SAMPLES DRAWN</label>
             <input type="number" id="sz-sample-qty" class="metro-input" min="0" step="1" placeholder="Enter number of sample packages drawn (e.g. 2, or leave blank if 0)" />
           </div>
 
@@ -303,7 +246,7 @@
               <option value="first">1st Offence — Non-Standard Package (Sec. 36(1)): Max fine ₹25,000</option>
               <option value="second">2nd Offence — Non-Standard Package (Sec. 36(1)): Max fine ₹50,000</option>
               <option value="subsequent">Subsequent Offence — Up to ₹1,00,000 / Prosecution (Sec. 36(1))</option>
-              <option value="sticker">Alteration / Sticker over MRP (Sec. 36(2)): Compounding ₹50,000</option>
+              <option value="sticker">Alteration / Sticker over declarations (Rule 6(3) r/w Sec. 36(1))</option>
               <option value="short_weight">Short-Weight / Quantity Discrepancy (Sec. 30): Max fine ₹10,000</option>
             </select>
           </div>

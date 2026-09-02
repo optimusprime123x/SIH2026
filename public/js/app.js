@@ -89,7 +89,6 @@
     if (!btn) return;
     $("#main-nav").querySelectorAll(".pivot-item").forEach((b) => b.classList.toggle("active", b === btn));
     $("#view-scan").hidden = btn.dataset.view !== "scan";
-    $("#view-ecommerce").hidden = btn.dataset.view !== "ecommerce";
     $("#view-history").hidden = btn.dataset.view !== "history";
     $("#view-dashboard").hidden = btn.dataset.view !== "dashboard";
     if (btn.dataset.view === "history") renderHistory();
@@ -374,6 +373,8 @@
         override: null,
         barcodes: evidence.barcodes,
         thumbs: evidence.thumbs,
+        // full-res copies for the evidence overlay — in-memory only, stripped before saving
+        fullImages: evidence.payload.map((p) => `data:${p.mimeType};base64,${p.data}`),
         saved: false,
       };
       renderResults();
@@ -606,7 +607,8 @@
     if (!rec?.thumbs?.length) return "";
 
     const activeIdx = Math.min(evidenceState.activeImgIdx, rec.thumbs.length - 1);
-    const activeThumb = rec.thumbs[activeIdx];
+    // Live scans keep the full-resolution images in memory; saved records only have 320px thumbs.
+    const activeThumb = rec.fullImages?.[activeIdx] ?? rec.thumbs[activeIdx];
 
     const itemsOnPhoto = (rec.results || []).filter(
       (r) => r.box_2d && r.box_2d.length === 4 && (r.image_index ?? 0) === activeIdx
@@ -696,14 +698,15 @@
       </section>`;
   }
 
-  function bindEvidenceMap(container, rec) {
+  /** `rerender` re-draws whichever surface hosts the map (live pane or history modal). */
+  function bindEvidenceMap(container, rec, rerender) {
     if (!container || !rec) return;
 
     // Photo Tab switching
     container.querySelectorAll(".evidence-tab").forEach((btn) => {
       btn.addEventListener("click", () => {
         evidenceState.activeImgIdx = Number(btn.dataset.idx);
-        renderResults();
+        rerender();
       });
     });
 
@@ -711,7 +714,7 @@
     container.querySelectorAll(".box-filter-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         evidenceState.filter = btn.dataset.filter;
-        renderResults();
+        rerender();
       });
     });
 
@@ -785,7 +788,7 @@
         const targetImg = Number(btn.dataset.img || 0);
         if (evidenceState.activeImgIdx !== targetImg) {
           evidenceState.activeImgIdx = targetImg;
-          renderResults();
+          rerender();
           setTimeout(() => highlightBox(checkId), 100);
         } else {
           highlightBox(checkId);
@@ -895,7 +898,7 @@
     el.innerHTML = toolbar + buildResultsBody(rec, true);
     renderIdentityPane(rec);
     bindToolbar();
-    bindEvidenceMap(el, rec);
+    bindEvidenceMap(el, rec, renderResults);
   }
 
   // Inspector resolution of review items — delegated because the results pane
@@ -974,7 +977,7 @@
     const rec = state.current;
     if (!rec || rec.saved) return;
     const scans = loadScans();
-    const { saved, ...toStore } = rec;
+    const { saved, fullImages, ...toStore } = rec;
     scans.unshift(toStore);
     if (storeScans(scans)) {
       rec.saved = true;
@@ -986,7 +989,7 @@
     const scans = loadScans();
     const idx = scans.findIndex((s) => s.id === rec.id);
     if (idx >= 0) {
-      const { saved, ...toStore } = rec;
+      const { saved, fullImages, ...toStore } = rec;
       scans[idx] = toStore;
       storeScans(scans);
     }
@@ -1168,8 +1171,13 @@
     state.detailId = id;
     $("#detail-title").textContent = rec.id;
     $("#detail-title").style.textTransform = "none";
-    $("#detail-body").innerHTML = buildResultsBody(rec, false);
-    bindEvidenceMap($("#detail-body"), rec);
+    // Records scanned before bounding boxes existed have no evidence map — show the plain photo strip instead.
+    const hasBoxes = (rec.results || []).some((r) => r.box_2d && r.box_2d.length === 4);
+    const photoStrip = !hasBoxes && rec.thumbs?.length
+      ? `<div class="detail-images">${rec.thumbs.map((t) => `<img src="${t}" alt="evidence" />`).join("")}</div>`
+      : "";
+    $("#detail-body").innerHTML = photoStrip + buildResultsBody(rec, false);
+    bindEvidenceMap($("#detail-body"), rec, () => openDetail(id));
 
     const hasViolations = Boolean(rec?.verdict?.counts?.violation || rec?.verdict?.counts?.missing || rec?.verdict?.verdict === "NON-COMPLIANT");
     const szBtn = $("#detail-seizure-btn");
@@ -1214,18 +1222,19 @@
     const p = ext.product || {};
     const d = ext.declarations || {};
 
-    const mfgText = d.manufacturer?.text || d.packer?.text || d.importer?.text || "";
-    $("#sz-premises").value = mfgText || (p.brand_name ? `M/s ${p.brand_name} Retail Outlet, Main Market` : "Commercial / Retail Premises");
-    $("#sz-person").value = "Shri Store In-Charge / Manager";
+    // A legal instrument must never carry invented parties: every identity
+    // field starts empty and is typed by the officer (placeholders guide format).
+    $("#sz-premises").value = "";
+    $("#sz-person").value = "";
     $("#sz-gstin").value = "";
     $("#sz-seized-qty").value = "";
     $("#sz-sample-qty").value = "";
     $("#sz-offence-type").value = d.sticker_over_declaration?.present ? "sticker" : "first";
     $("#sz-notice-period").value = "15";
-    $("#sz-witness1").value = "Amit Verma, Local Resident / Merchant";
-    $("#sz-witness2").value = "Sunil Patil, Local Resident / Merchant";
-    $("#sz-officer").value = `Inspector ${(state.role || "inspector").toUpperCase()}, Legal Metrology`;
-    $("#sz-circle").value = "Flying Squad / Central Enforcement Circle";
+    $("#sz-witness1").value = "";
+    $("#sz-witness2").value = "";
+    $("#sz-officer").value = "";
+    $("#sz-circle").value = "";
 
     $("#seizure-error").hidden = true;
     $("#seizure-modal").hidden = false;
@@ -1256,8 +1265,8 @@
       premises,
       person,
       gstin: $("#sz-gstin").value.trim(),
-      seizedQty: `${seizedQtyRaw} package(s) seized and sealed under Form IV`,
-      sampleQty: sampleQtyRaw && Number(sampleQtyRaw) > 0 ? `${sampleQtyRaw} package(s) drawn for calibration under Rule 24` : "Nil (No samples drawn)",
+      seizedQty: `${seizedQtyRaw} package(s) seized and sealed`,
+      sampleQty: sampleQtyRaw && Number(sampleQtyRaw) > 0 ? `${sampleQtyRaw} package(s) drawn as samples` : "Nil (No samples drawn)",
       offenceType: $("#sz-offence-type").value,
       noticePeriod: $("#sz-notice-period").value,
       witness1,
@@ -1269,177 +1278,6 @@
     window.LMPCExport.exportSeizureNotice(seizureTargetRecord, formData);
     $("#seizure-modal").hidden = true;
   });
-
-  // ============================== e-commerce audit (rule 6(10)) ==============================
-
-  let currentEcomAudit = null;
-
-  $("#ecom-paste-btn")?.addEventListener("click", async () => {
-    try {
-      const text = await navigator.clipboard.readText();
-      if (text) {
-        $("#ecom-url-input").value = text.trim();
-        triggerEcomAudit();
-      }
-    } catch {
-      $("#ecom-url-input").focus();
-    }
-  });
-
-  document.querySelectorAll(".ecom-chip-btn").forEach((chip) => {
-    chip.addEventListener("click", () => {
-      const demo = chip.dataset.demo;
-      triggerEcomAudit(demo);
-    });
-  });
-
-  $("#ecom-audit-btn")?.addEventListener("click", () => triggerEcomAudit());
-  $("#ecom-url-input")?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") triggerEcomAudit();
-  });
-
-  async function triggerEcomAudit(demoKey) {
-    const urlInput = $("#ecom-url-input");
-    const rawUrl = urlInput.value.trim();
-
-    if (!demoKey && !rawUrl) {
-      alert("Please paste an e-commerce product listing URL or select one of the quick test demos.");
-      urlInput.focus();
-      return;
-    }
-
-    $("#ecom-empty").hidden = true;
-    $("#ecom-results").hidden = true;
-    $("#ecom-loading").hidden = false;
-    $("#ecom-loading-text").textContent = demoKey
-      ? `Fetching verified ${demoKey.toUpperCase()} listing dataset...`
-      : "Connecting to marketplace, scraping product page and evaluating Rule 6(10)...";
-
-    try {
-      const res = await fetch("/api/audit-url", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-lmpc-auth": PASSWORD,
-        },
-        body: JSON.stringify({ url: rawUrl, demo: demoKey }),
-      });
-
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        throw new Error(json.error || "Failed to audit listing.");
-      }
-
-      if (json.data?.url) urlInput.value = json.data.url;
-      renderEcomResults(json.data);
-    } catch (err) {
-      $("#ecom-loading").hidden = true;
-      $("#ecom-empty").hidden = false;
-      alert(`Audit failed: ${err.message}`);
-    }
-  }
-
-  function renderEcomResults(data) {
-    currentEcomAudit = data;
-    const isCompliant = data.verdict === "COMPLIANT";
-    const statusClass = isCompliant ? "s-pass" : "s-violation";
-
-    let specsHtml = "";
-    if (data.specifications && Object.keys(data.specifications).length) {
-      specsHtml = `<table class="ecom-spec-table">` +
-        Object.entries(data.specifications).map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("") +
-        `</table>`;
-    }
-
-    let checksHtml = "";
-    for (const c of (data.checks || [])) {
-      const isPass = c.status === "pass";
-      checksHtml += `
-        <div class="ecom-check-card ${isPass ? "c-pass" : "c-viol"}">
-          <div class="ecom-check-head">
-            <span class="ecom-check-status">${isPass ? "✓ COMPLIANT" : "✕ VIOLATION"}</span>
-            <span class="ecom-check-clause">${esc(c.clause)}</span>
-          </div>
-          <h4 class="ecom-check-title">${esc(c.title)}</h4>
-          <p class="ecom-check-extracted"><strong>Found on listing:</strong> <code>${esc(c.extracted || "—")}</code></p>
-          <p class="ecom-check-finding">${esc(c.finding)}</p>
-        </div>`;
-    }
-
-    const html = `
-      <div class="ecom-results-grid">
-        <!-- LEFT: SCRAPED LISTING PREVIEW -->
-        <div class="ecom-col-preview tile">
-          <div class="ecom-col-head">
-            <span class="metro-label">scraped listing preview</span>
-            <span class="ecom-platform-badge">${esc(data.platform || "Marketplace")}</span>
-          </div>
-          <div class="ecom-product-card">
-            <div class="ecom-img-wrap">
-              <img src="${esc(data.image || "")}" alt="${esc(data.title)}" class="ecom-main-img" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'200\\' height=\\'200\\' viewBox=\\'0 0 200 200\\'><rect fill=\\'%23112233\\' width=\\'200\\' height=\\'200\\'/><text fill=\\'%2399aabb\\' x=\\'50%\\' y=\\'50%\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>No Image</text></svg>'"/>
-            </div>
-            <div class="ecom-prod-meta">
-              <h3 class="ecom-prod-title">${esc(data.title)}</h3>
-              <div class="ecom-pricing-row">
-                <span class="ecom-price">${esc(data.price || "—")}</span>
-                <span class="ecom-qty-tag">${esc(data.net_quantity || "Pack")}</span>
-              </div>
-              <div class="ecom-seller-tag">Seller: <strong>${esc(data.seller || "Marketplace Merchant")}</strong></div>
-              <div class="ecom-url-tag"><a href="${esc(data.url)}" target="_blank" rel="noopener">Open Original Listing ↗</a></div>
-            </div>
-          </div>
-          <div class="ecom-specs-section">
-            <p class="metro-label">scraped specification table</p>
-            ${specsHtml}
-          </div>
-        </div>
-
-        <!-- RIGHT: RULE 6(10) SCORECARD & ACTIONS -->
-        <div class="ecom-col-audit tile">
-          <div class="ecom-col-head">
-            <span class="metro-label">statutory compliance scorecard</span>
-            <span class="ecom-score-badge">${data.score?.passed ?? 0} / ${data.score?.total ?? 7} Compliant</span>
-          </div>
-
-          <div class="ecom-verdict-banner ${statusClass}">
-            <div class="ecom-vb-icon">${isCompliant ? "✓" : "⚠️"}</div>
-            <div class="ecom-vb-text">
-              <h3>${isCompliant ? "COMPLIANT DIGITAL LISTING" : "NON-COMPLIANT DIGITAL LISTING"}</h3>
-              <p>${isCompliant ? "All mandatory pre-purchase declarations are present under Rule 6(10)." : `${data.score?.violations || "Multiple"} statutory contravention(s) detected under Rule 6(10).`}</p>
-            </div>
-          </div>
-
-          <div class="ecom-actions-bar">
-            <button class="btn btn-accent" id="ecom-export-pdf">EXPORT AUDIT REPORT (PDF) ↧</button>
-            ${!isCompliant ? `<button class="btn btn-saffron" id="ecom-notice-btn">GENERATE MARKETPLACE NOTICE ⚖️</button>` : ""}
-            <button class="btn btn-ghost" id="ecom-reset-btn">AUDIT ANOTHER</button>
-          </div>
-
-          <div class="ecom-checks-list">
-            ${checksHtml}
-          </div>
-        </div>
-      </div>`;
-
-    $("#ecom-results").innerHTML = html;
-    $("#ecom-results").hidden = false;
-    $("#ecom-loading").hidden = true;
-    $("#ecom-empty").hidden = true;
-
-    $("#ecom-export-pdf")?.addEventListener("click", () => {
-      if (currentEcomAudit) window.LMPCExport.exportEcomAuditPdf(currentEcomAudit);
-    });
-    $("#ecom-notice-btn")?.addEventListener("click", () => {
-      if (currentEcomAudit) window.LMPCExport.exportEcomNoticePdf(currentEcomAudit);
-    });
-    $("#ecom-reset-btn")?.addEventListener("click", () => {
-      $("#ecom-results").hidden = true;
-      $("#ecom-results").innerHTML = "";
-      $("#ecom-empty").hidden = false;
-      $("#ecom-url-input").value = "";
-      $("#ecom-url-input").focus();
-    });
-  }
 
   // close modals on scrim click or Escape
   for (const id of ["override-modal", "detail-modal", "seizure-modal"]) {

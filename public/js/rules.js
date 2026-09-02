@@ -233,14 +233,17 @@ function parseDeclaredUSP(text) {
     isIllegalMultiplier = true;
   }
 
-  // Match price numeric digits: e.g. "0.85", "245.00"
+  // Match the price: prefer the number attached to a currency marker so
+  // "1 kg = ₹510" reads 510, not 1. Fall back to the first number.
   let price = null;
-  const priceMatch = t.match(/(?:(?:usp|mrp|price|unit\s*sale\s*price|rate)\s*[:=-]?\s*)?(?:₹|rs\.?|inr|rupees)?\s*[:=-]?\s*(\d+(?:\.\d+)?)/);
-  if (priceMatch) {
-    price = parseFloat(priceMatch[1]);
+  const currencyMatch =
+    t.match(/(?:₹|rs\.?|inr|rupees)\s*[:=-]?\s*(\d+(?:\.\d+)?)/) ||
+    t.match(/(\d+(?:\.\d+)?)\s*(?:₹|rs\.?|inr|rupees)\b/);
+  if (currencyMatch) {
+    price = parseFloat(currencyMatch[1]);
   } else {
-    const anyNum = t.match(/(\d+(?:\.\d+)?)/);
-    if (anyNum) price = parseFloat(anyNum[1]);
+    const priceMatch = t.match(/(?:usp|price|unit\s*sale\s*price|rate)\s*[:=-]?\s*(\d+(?:\.\d+)?)/) || t.match(/(\d+(?:\.\d+)?)/);
+    if (priceMatch) price = parseFloat(priceMatch[1]);
   }
 
   // Match declared unit
