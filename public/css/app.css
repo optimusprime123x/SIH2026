@@ -865,6 +865,11 @@ textarea.metro-input { resize: vertical; }
 }
 .modal-wide { width: min(900px, 100%); max-height: 88vh; overflow-y: auto; }
 #override-modal { z-index: 60; } /* must stack above the history detail modal */
+#confirm-modal { z-index: 70; }  /* confirm/notice sits above every other dialog */
+.modal-confirm { width: min(440px, 100%); }
+.modal-confirm .confirm-message { color: var(--muted); font-size: 14px; line-height: 1.6; margin-top: -4px; }
+.btn-crimson { background: var(--crimson); color: #fff; }
+.btn-crimson:hover:not(:disabled) { background: #c42619; box-shadow: 0 6px 18px rgba(217, 45, 32, 0.28); }
 
 .detail-images { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 16px; }
 .detail-images img { height: 92px; border: 1px solid var(--border); border-radius: var(--r); }

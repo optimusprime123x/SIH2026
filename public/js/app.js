@@ -312,8 +312,15 @@
   ];
   let loadingTimer = null;
 
-  $("#scan-btn").addEventListener("click", () => {
-    if (state.current && !state.current.saved && !confirm("Start a fresh scan and discard the current unsaved result?")) return;
+  $("#scan-btn").addEventListener("click", async () => {
+    if (state.current && !state.current.saved) {
+      const ok = await askConfirm({
+        label: "unsaved result", title: "start a fresh scan?",
+        message: "The current result has not been saved to the repository and will be discarded.",
+        confirmText: "DISCARD & RESCAN", danger: true,
+      });
+      if (!ok) return;
+    }
     startScan(false);
   });
 
@@ -945,8 +952,15 @@
     });
   }
 
-  function clearScan() {
-    if (state.current && !state.current.saved && !confirm("Discard this unsaved scan?")) return;
+  async function clearScan() {
+    if (state.current && !state.current.saved) {
+      const ok = await askConfirm({
+        label: "unsaved result", title: "discard this scan?",
+        message: "The images and results will be cleared without saving to the repository.",
+        confirmText: "DISCARD", danger: true,
+      });
+      if (!ok) return;
+    }
     state.images = [];
     state.current = null;
     state.attempts = 0;
@@ -968,7 +982,7 @@
       localStorage.setItem(LS_SCANS, JSON.stringify(scans));
       return true;
     } catch (err) {
-      alert("Could not save — local storage is full or blocked. Delete old inspections from History.");
+      showNotice("could not save", "Local storage is full or blocked. Delete old inspections from History and try again.");
       return false;
     }
   }
@@ -1089,14 +1103,18 @@
     if (row) { e.preventDefault(); openDetail(row.dataset.id); }
   });
 
-  $("#history-clear-btn").addEventListener("click", () => {
+  $("#history-clear-btn").addEventListener("click", async () => {
     if (!loadScans().length) return;
-    if (confirm("Delete ALL saved inspections? This cannot be undone.")) {
-      safeRemove("localStorage", LS_SCANS);
-      renderHistory();
-      // the live scan is no longer in the repository — allow saving it again
-      if (state.current?.saved) { state.current.saved = false; renderResults(); }
-    }
+    const ok = await askConfirm({
+      label: "repository", title: "delete all inspections?",
+      message: "Every saved inspection in this browser will be permanently removed. This cannot be undone.",
+      confirmText: "DELETE ALL", danger: true,
+    });
+    if (!ok) return;
+    safeRemove("localStorage", LS_SCANS);
+    renderHistory();
+    // the live scan is no longer in the repository — allow saving it again
+    if (state.current?.saved) { state.current.saved = false; renderResults(); }
   });
 
   // ============================== dashboard ==============================
@@ -1201,9 +1219,15 @@
     const rec = loadScans().find((s) => s.id === state.detailId);
     if (rec) window.LMPCExport.exportPdf(rec);
   });
-  $("#detail-delete").addEventListener("click", () => {
-    if (!state.detailId || !confirm("Delete this saved inspection?")) return;
+  $("#detail-delete").addEventListener("click", async () => {
+    if (!state.detailId) return;
     const deletedId = state.detailId;
+    const ok = await askConfirm({
+      label: "repository", title: "delete this inspection?",
+      message: `${deletedId} will be permanently removed from the repository.`,
+      confirmText: "DELETE", danger: true,
+    });
+    if (!ok) return;
     storeScans(loadScans().filter((s) => s.id !== deletedId));
     $("#detail-modal").hidden = true;
     state.detailId = null;
@@ -1279,6 +1303,45 @@
     $("#seizure-modal").hidden = true;
   });
 
+  // ============================== confirm / notice dialog ==============================
+  // Metro-styled replacement for native confirm()/alert(). Resolves true/false.
+
+  let confirmResolve = null;
+
+  function closeConfirm(result) {
+    $("#confirm-modal").hidden = true;
+    const resolve = confirmResolve;
+    confirmResolve = null;
+    if (resolve) resolve(result);
+  }
+
+  function askConfirm({ label = "confirm", title, message, confirmText = "CONFIRM", cancelText = "CANCEL", danger = false }) {
+    return new Promise((resolve) => {
+      if (confirmResolve) confirmResolve(false); // a dialog was already open — dismiss it
+      confirmResolve = resolve;
+      $("#confirm-label").textContent = label;
+      $("#confirm-title").textContent = title;
+      $("#confirm-message").textContent = message;
+      const ok = $("#confirm-ok");
+      ok.textContent = confirmText;
+      ok.className = `btn ${danger ? "btn-crimson" : "btn-accent"}`;
+      const cancel = $("#confirm-cancel");
+      cancel.hidden = cancelText === null;
+      cancel.textContent = cancelText ?? "";
+      $("#confirm-modal").hidden = false;
+      ok.focus();
+    });
+  }
+
+  /** One-button variant for errors and information. */
+  function showNotice(title, message) {
+    return askConfirm({ label: "notice", title, message, confirmText: "OK", cancelText: null });
+  }
+
+  $("#confirm-ok").addEventListener("click", () => closeConfirm(true));
+  $("#confirm-cancel").addEventListener("click", () => closeConfirm(false));
+  $("#confirm-modal").addEventListener("click", (e) => { if (e.target.id === "confirm-modal") closeConfirm(false); });
+
   // close modals on scrim click or Escape
   for (const id of ["override-modal", "detail-modal", "seizure-modal"]) {
     $("#" + id).addEventListener("click", (e) => {
@@ -1291,7 +1354,8 @@
   }
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    if (!$("#seizure-modal").hidden) { $("#seizure-modal").hidden = true; seizureTargetRecord = null; }
+    if (!$("#confirm-modal").hidden) closeConfirm(false);
+    else if (!$("#seizure-modal").hidden) { $("#seizure-modal").hidden = true; seizureTargetRecord = null; }
     else if (!$("#override-modal").hidden) $("#override-modal").hidden = true;
     else if (!$("#detail-modal").hidden) { $("#detail-modal").hidden = true; state.detailId = null; }
   });

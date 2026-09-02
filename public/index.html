@@ -285,9 +285,22 @@
 
         <div class="btn-row" style="margin-top: 18px;">
           <button type="button" class="btn btn-ghost" id="seizure-cancel">CANCEL</button>
-          <button type="submit" class="btn btn-accent-seizure" id="seizure-download-btn">DOWNLOAD COURT-READY NOTICE (PDF) ⚖️</button>
+          <button type="submit" class="btn btn-accent-seizure" id="seizure-download-btn">DOWNLOAD DRAFT NOTICE (PDF)</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- ============ CONFIRM / NOTICE MODAL (replaces native confirm/alert) ============ -->
+  <div class="modal-scrim" id="confirm-modal" hidden>
+    <div class="tile modal modal-confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <p class="metro-label" id="confirm-label">confirm</p>
+      <h2 class="pane-title" id="confirm-title">are you sure?</h2>
+      <p class="confirm-message" id="confirm-message"></p>
+      <div class="btn-row">
+        <button type="button" class="btn btn-ghost" id="confirm-cancel">CANCEL</button>
+        <button type="button" class="btn btn-accent" id="confirm-ok">CONFIRM</button>
+      </div>
     </div>
   </div>
 
