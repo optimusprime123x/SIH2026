@@ -30,6 +30,7 @@
     scanning: false,
     current: null,   // active scan record
     detailId: null,  // record open in history detail modal
+    detailRecord: null, // that record, fetched from the repository
   };
 
   // ============================== theme ==============================
@@ -74,7 +75,7 @@
     $("#view-login").hidden = true;
     $("#app-shell").hidden = false;
     $("#role-chip").textContent = role.toUpperCase();
-    renderHistory();
+    migrateLocalScans().finally(renderHistory);
   }
 
   const existing = safeGet("sessionStorage", SS_SESSION);
@@ -141,7 +142,8 @@
     updateScanButton();
   }
 
-  /** Single decode: one 1600px canvas feeds the API image and the 320px thumb
+  /** Single decode: one 1600px canvas feeds the API image and one 512px copy
+   *  that serves as thumbnail, evidence overlay and the R2-stored photo
    *  (canvas drawImage applies EXIF orientation). Barcode decoding is deferred
    *  to scan time — it is heavy and would jank the upload UI. */
   function processImage(file) {
@@ -150,7 +152,7 @@
       const img = new Image();
       img.onload = () => {
         const big = drawScaled(img, 1600);
-        const thumb = drawScaled(big, 320).toDataURL("image/jpeg", 0.72);
+        const thumb = drawScaled(big, 512).toDataURL("image/jpeg", 0.8);
         URL.revokeObjectURL(url);
         resolve({ apiData: big.toDataURL("image/jpeg", 0.87).split(",")[1], thumb });
       };
@@ -894,7 +896,7 @@
     const toolbar = `
       <div class="results-toolbar">
         <button class="btn btn-navy" id="retry-btn" ${retryLeft <= 0 || rec.saved ? "disabled" : ""}>RETRY (${Math.max(retryLeft, 0)} LEFT)</button>
-        <button class="btn btn-green" id="save-btn" ${rec.saved ? "disabled" : ""}>${rec.saved ? "SAVED ✓" : "ACCEPT VERDICT & SAVE"}</button>
+        <button class="btn btn-green" id="save-btn" ${rec.saved || rec.saving ? "disabled" : ""}>${rec.saved ? "SAVED ✓" : rec.saving ? "SAVING…" : "ACCEPT VERDICT & SAVE"}</button>
         ${hasViolations ? `<button class="btn btn-saffron" id="seizure-btn">SEIZURE MEMO ⚖️</button>` : ""}
         ${state.role === "admin" ? `<button class="btn btn-ghost" id="override-btn">OVERRIDE VERDICT</button>` : ""}
         <button class="btn btn-ghost" id="export-btn">EXPORT PDF ↧</button>
@@ -948,7 +950,7 @@
     $("#override-btn")?.addEventListener("click", openOverride);
     $("#seizure-btn")?.addEventListener("click", () => openSeizureModal(state.current));
     $("#export-btn")?.addEventListener("click", () => {
-      if (state.current) window.LMPCExport.exportPdf(state.current);
+      if (state.current) exportRecordPdf(state.current);
     });
   }
 
@@ -972,41 +974,74 @@
     $("#results-empty").hidden = false;
   }
 
-  // ============================== persistence ==============================
+  // ============================== persistence (D1 + R2 through the worker API) ==============================
 
-  function loadScans() {
-    try { return JSON.parse(safeGet("localStorage", LS_SCANS)) || []; } catch { return []; }
-  }
-  function storeScans(scans) {
-    try {
-      localStorage.setItem(LS_SCANS, JSON.stringify(scans));
-      return true;
-    } catch (err) {
-      showNotice("could not save", "Local storage is full or blocked. Delete old inspections from History and try again.");
-      return false;
-    }
+  async function api(path, options = {}) {
+    const res = await fetch(path, {
+      ...options,
+      headers: { "content-type": "application/json", "x-lmpc-auth": PASSWORD, ...(options.headers || {}) },
+    });
+    const body = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+    if (!res.ok || !body.ok) throw new Error(body.error || `Request failed (${res.status})`);
+    return body;
   }
 
-  function saveScan() {
+  const fetchInspection = async (id) => (await api(`/api/inspections/${encodeURIComponent(id)}`)).inspection;
+
+  /** PDF generation is async (evidence photos may be R2 URLs) — surface failures. */
+  function exportRecordPdf(rec) {
+    Promise.resolve(window.LMPCExport.exportPdf(rec)).catch((err) => showNotice("export failed", err.message));
+  }
+
+  async function saveScan() {
     const rec = state.current;
-    if (!rec || rec.saved) return;
-    const scans = loadScans();
-    const { saved, fullImages, ...toStore } = rec;
-    scans.unshift(toStore);
-    if (storeScans(scans)) {
+    if (!rec || rec.saved || rec.saving) return;
+    rec.saving = true;
+    renderResults();
+    try {
+      // 512px images travel as data URLs; the worker stores them in R2 and returns their URLs.
+      const { saved, saving, fullImages, thumbs, ...meta } = rec;
+      const body = await api("/api/inspections", { method: "POST", body: JSON.stringify({ ...meta, images: thumbs }) });
+      rec.thumbs = body.thumbs;
       rec.saved = true;
+    } catch (err) {
+      showNotice("could not save", `The inspection was not stored in the repository: ${err.message}`);
+    } finally {
+      rec.saving = false;
       renderResults();
     }
   }
 
-  function updateStoredScan(rec) {
-    const scans = loadScans();
-    const idx = scans.findIndex((s) => s.id === rec.id);
-    if (idx >= 0) {
-      const { saved, fullImages, ...toStore } = rec;
-      scans[idx] = toStore;
-      storeScans(scans);
+  /** Push override / resolution changes on an already-saved record. */
+  async function updateStoredScan(rec) {
+    try {
+      await api(`/api/inspections/${encodeURIComponent(rec.id)}`, {
+        method: "PUT",
+        body: JSON.stringify({ override: rec.override, results: rec.results, verdict: rec.verdict }),
+      });
+    } catch (err) {
+      showNotice("could not update", `The change was not stored in the repository: ${err.message}`);
     }
+  }
+
+  /** One-time import of inspections saved by the localStorage-era prototype. */
+  async function migrateLocalScans() {
+    let legacy = [];
+    try { legacy = JSON.parse(safeGet("localStorage", LS_SCANS)) || []; } catch { legacy = []; }
+    if (!legacy.length) return;
+    let imported = 0;
+    for (const rec of legacy) {
+      try {
+        const { thumbs, fullImages, saved, ...meta } = rec;
+        await api("/api/inspections", { method: "POST", body: JSON.stringify({ ...meta, images: thumbs || [] }) });
+        imported += 1;
+      } catch (err) {
+        if (/UNIQUE/i.test(err.message)) imported += 1; // already there from an earlier attempt
+        else console.warn("Could not import", rec.id, err.message);
+      }
+    }
+    if (imported === legacy.length) safeRemove("localStorage", LS_SCANS);
+    showNotice("repository upgraded", `${imported} of ${legacy.length} locally stored inspection${legacy.length > 1 ? "s" : ""} moved into the database.`);
   }
 
   // ============================== override (admin) ==============================
@@ -1045,52 +1080,63 @@
       if (state.current.saved) updateStoredScan(state.current);
       renderResults();
     } else {
-      const scans = loadScans();
-      const rec = scans.find((s) => s.id === overrideTarget);
-      if (rec) {
-        rec.override = override;
-        storeScans(scans);
-        renderHistory();
-        // keep the live scan pane in sync if it shows the same record
-        if (state.current?.id === rec.id) {
-          state.current.override = override;
-          renderResults();
+      const id = overrideTarget;
+      $("#override-modal").hidden = true;
+      (async () => {
+        try {
+          await api(`/api/inspections/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ override }) });
+          if (state.detailRecord?.id === id) state.detailRecord.override = override;
+          renderHistory();
+          // keep the live scan pane in sync if it shows the same record
+          if (state.current?.id === id) { state.current.override = override; renderResults(); }
+          if (state.detailId === id) openDetail(id);
+        } catch (err) {
+          showNotice("could not override", err.message);
         }
-        if (state.detailId === rec.id) openDetail(rec.id);
-      }
+      })();
+      return;
     }
     $("#override-modal").hidden = true;
   });
 
   // ============================== history ==============================
 
-  function renderHistory() {
-    const scans = loadScans();
-    $("#history-empty").hidden = scans.length > 0;
-    $("#history-list").innerHTML = scans
-      .map((s) => {
-        const v = s.override ? s.override.verdict : s.verdict.verdict;
-        const p = s.extraction?.product ?? {};
-        return `
+  async function renderHistory() {
+    const q = $("#history-search")?.value.trim() ?? "";
+    let rows;
+    try {
+      rows = (await api(`/api/inspections${q ? `?q=${encodeURIComponent(q)}` : ""}`)).inspections;
+    } catch (err) {
+      $("#history-empty").hidden = true;
+      $("#history-list").innerHTML = `<div class="mock-banner">Could not load the repository — ${esc(err.message)}</div>`;
+      return;
+    }
+    $("#history-empty").hidden = rows.length > 0;
+    $("#history-list").innerHTML = rows
+      .map((s) => `
         <div class="history-row" data-id="${esc(s.id)}" role="button" tabindex="0" aria-label="Open inspection ${esc(s.id)}">
-          <div class="hr-edge ${verdictClass(v)}"></div>
-          ${s.thumbs?.[0] ? `<img class="hr-thumb" src="${s.thumbs[0]}" alt="" />` : `<div class="hr-thumb"></div>`}
+          <div class="hr-edge ${verdictClass(s.finalVerdict)}"></div>
+          ${s.thumb ? `<img class="hr-thumb" src="${esc(s.thumb)}" alt="" loading="lazy" />` : `<div class="hr-thumb"></div>`}
           <div class="hr-main">
-            <div class="hr-title">${esc(p.brand_name || p.product_description || "Unnamed product")}</div>
-            <div class="hr-sub">${esc(s.id)} · ${esc(new Date(s.ts).toLocaleString("en-IN"))} · ${esc((s.role || "").toUpperCase())}${s.override ? " · OVERRIDDEN" : ""}${s.mock ? " · MOCK" : ""}</div>
+            <div class="hr-title">${esc(s.brand || s.product || "Unnamed product")}</div>
+            <div class="hr-sub">${esc(s.id)} · ${esc(new Date(s.ts).toLocaleString("en-IN"))} · ${esc((s.role || "").toUpperCase())}${s.overridden ? " · OVERRIDDEN" : ""}${s.mock ? " · MOCK" : ""}</div>
           </div>
-          <span class="hr-verdict ${verdictClass(v)}">${esc(v)}</span>
+          <span class="hr-verdict ${verdictClass(s.finalVerdict)}">${esc(s.finalVerdict)}</span>
           <button class="icon-btn hr-export" data-id="${esc(s.id)}" title="Export PDF">↧</button>
-        </div>`;
-      })
+        </div>`)
       .join("");
   }
 
-  $("#history-list").addEventListener("click", (e) => {
+  let searchTimer = null;
+  $("#history-search")?.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderHistory, 250);
+  });
+
+  $("#history-list").addEventListener("click", async (e) => {
     const exportBtn = e.target.closest(".hr-export");
     if (exportBtn) {
-      const rec = loadScans().find((s) => s.id === exportBtn.dataset.id);
-      if (rec) window.LMPCExport.exportPdf(rec);
+      try { exportRecordPdf(await fetchInspection(exportBtn.dataset.id)); } catch (err) { showNotice("export failed", err.message); }
       return;
     }
     const row = e.target.closest(".history-row");
@@ -1104,55 +1150,44 @@
   });
 
   $("#history-clear-btn").addEventListener("click", async () => {
-    if (!loadScans().length) return;
     const ok = await askConfirm({
       label: "repository", title: "delete all inspections?",
-      message: "Every saved inspection in this browser will be permanently removed. This cannot be undone.",
+      message: "Every saved inspection and its evidence photos will be permanently removed from the database. This cannot be undone.",
       confirmText: "DELETE ALL", danger: true,
     });
     if (!ok) return;
-    safeRemove("localStorage", LS_SCANS);
-    renderHistory();
-    // the live scan is no longer in the repository — allow saving it again
-    if (state.current?.saved) { state.current.saved = false; renderResults(); }
+    try {
+      await api("/api/inspections", { method: "DELETE" });
+      renderHistory();
+      // the live scan is no longer in the repository — allow saving it again
+      if (state.current?.saved) { state.current.saved = false; renderResults(); }
+    } catch (err) {
+      showNotice("could not delete", err.message);
+    }
   });
 
   // ============================== dashboard ==============================
 
-  function renderDashboard() {
-    const scans = loadScans();
-    $("#dash-empty").hidden = scans.length > 0;
-    $("#dash-content").hidden = !scans.length;
-    if (!scans.length) return;
-
-    const finalVerdict = (s) => (s.override ? s.override.verdict : s.verdict.verdict);
-    const verdictCounts = {};
-    let totalViolations = 0;
-    let overrides = 0;
-    const clauseMap = new Map(); // clause -> {title, count}
-
-    for (const s of scans) {
-      const v = finalVerdict(s);
-      verdictCounts[v] = (verdictCounts[v] ?? 0) + 1;
-      if (s.override) overrides += 1;
-      for (const r of s.results ?? []) {
-        if (r.status === "violation" || r.status === "missing") {
-          totalViolations += 1;
-          const entry = clauseMap.get(r.clause) ?? { title: r.title, count: 0 };
-          entry.count += 1;
-          clauseMap.set(r.clause, entry);
-        }
-      }
+  async function renderDashboard() {
+    let stats;
+    try {
+      stats = (await api("/api/stats")).stats;
+    } catch (err) {
+      showNotice("dashboard unavailable", err.message);
+      return;
     }
+    $("#dash-empty").hidden = stats.total > 0;
+    $("#dash-content").hidden = !stats.total;
+    if (!stats.total) return;
 
-    const compliant = verdictCounts["COMPLIANT"] ?? 0;
-    const rate = Math.round((compliant / scans.length) * 100);
+    const verdictCounts = Object.fromEntries(stats.byVerdict.map((r) => [r.verdict, r.count]));
+    const rate = Math.round((stats.compliant / stats.total) * 100);
 
     $("#stat-row").innerHTML = [
-      { label: "inspections", value: scans.length, cls: "" },
+      { label: "inspections", value: stats.total, cls: "" },
       { label: "compliance rate", value: `${rate}%`, cls: rate >= 50 ? "stat-green" : "stat-crimson" },
-      { label: "violations found", value: totalViolations, cls: totalViolations ? "stat-crimson" : "stat-green" },
-      { label: "admin overrides", value: overrides, cls: overrides ? "stat-saffron" : "" },
+      { label: "violations found", value: stats.violations, cls: stats.violations ? "stat-crimson" : "stat-green" },
+      { label: "admin overrides", value: stats.overrides, cls: stats.overrides ? "stat-saffron" : "" },
     ].map((t) => `
       <div class="tile stat-tile ${t.cls}">
         <span class="stat-value">${esc(String(t.value))}</span>
@@ -1167,15 +1202,15 @@
     $("#verdict-legend").innerHTML = present.map((v) => `
       <span class="vl-item"><span class="vl-dot ${verdictClass(v)}"></span>${esc(v.toLowerCase())} <b>${verdictCounts[v]}</b></span>`).join("");
 
-    // top violated clauses
-    const ranked = [...clauseMap.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 6);
-    const max = ranked[0]?.[1].count ?? 1;
+    // top violated clauses (SQL-aggregated by the worker)
+    const ranked = stats.topClauses;
+    const max = ranked[0]?.count ?? 1;
     $("#clause-ranks").innerHTML = ranked.length
-      ? ranked.map(([clause, e]) => `
+      ? ranked.map((e) => `
         <div class="clause-rank">
           <div class="cr-head">
-            <span class="clause-chip">${esc(clause)}</span>
-            <span class="cr-title">${esc(e.title)}</span>
+            <span class="clause-chip">${esc(e.clause)}</span>
+            <span class="cr-title">${esc(e.title ?? "")}</span>
             <span class="cr-count">${e.count}</span>
           </div>
           <div class="cr-bar"><span style="width:${Math.round((e.count / max) * 100)}%"></span></div>
@@ -1183,10 +1218,16 @@
       : `<p class="muted">No violations recorded — every saved inspection is compliant.</p>`;
   }
 
-  function openDetail(id) {
-    const rec = loadScans().find((s) => s.id === id);
-    if (!rec) return;
+  async function openDetail(id) {
+    let rec;
+    try {
+      rec = state.detailRecord?.id === id ? state.detailRecord : await fetchInspection(id);
+    } catch (err) {
+      showNotice("could not open", err.message);
+      return;
+    }
     state.detailId = id;
+    state.detailRecord = rec;
     $("#detail-title").textContent = rec.id;
     $("#detail-title").style.textTransform = "none";
     // Records scanned before bounding boxes existed have no evidence map — show the plain photo strip instead.
@@ -1206,31 +1247,39 @@
     $("#detail-modal").hidden = false;
   }
 
+  function closeDetail() {
+    $("#detail-modal").hidden = true;
+    state.detailId = null;
+    state.detailRecord = null;
+  }
+
   $("#detail-seizure-btn")?.addEventListener("click", () => {
-    const rec = loadScans().find((s) => s.id === state.detailId);
-    if (rec) openSeizureModal(rec);
+    if (state.detailRecord) openSeizureModal(state.detailRecord);
   });
   $("#detail-override-btn")?.addEventListener("click", () => {
     if (state.detailId) openOverride(state.detailId);
   });
 
-  $("#detail-close").addEventListener("click", () => { $("#detail-modal").hidden = true; state.detailId = null; });
+  $("#detail-close").addEventListener("click", closeDetail);
   $("#detail-export").addEventListener("click", () => {
-    const rec = loadScans().find((s) => s.id === state.detailId);
-    if (rec) window.LMPCExport.exportPdf(rec);
+    if (state.detailRecord) exportRecordPdf(state.detailRecord);
   });
   $("#detail-delete").addEventListener("click", async () => {
     if (!state.detailId) return;
     const deletedId = state.detailId;
     const ok = await askConfirm({
       label: "repository", title: "delete this inspection?",
-      message: `${deletedId} will be permanently removed from the repository.`,
+      message: `${deletedId} and its evidence photos will be permanently removed from the database.`,
       confirmText: "DELETE", danger: true,
     });
     if (!ok) return;
-    storeScans(loadScans().filter((s) => s.id !== deletedId));
-    $("#detail-modal").hidden = true;
-    state.detailId = null;
+    try {
+      await api(`/api/inspections/${encodeURIComponent(deletedId)}`, { method: "DELETE" });
+    } catch (err) {
+      showNotice("could not delete", err.message);
+      return;
+    }
+    closeDetail();
     renderHistory();
     if (state.current?.id === deletedId) { state.current.saved = false; renderResults(); }
   });
@@ -1299,7 +1348,8 @@
       circle,
     };
 
-    window.LMPCExport.exportSeizureNotice(seizureTargetRecord, formData);
+    Promise.resolve(window.LMPCExport.exportSeizureNotice(seizureTargetRecord, formData))
+      .catch((err) => showNotice("export failed", err.message));
     $("#seizure-modal").hidden = true;
   });
 
@@ -1347,7 +1397,7 @@
     $("#" + id).addEventListener("click", (e) => {
       if (e.target.id === id) {
         $("#" + id).hidden = true;
-        if (id === "detail-modal") state.detailId = null;
+        if (id === "detail-modal") { state.detailId = null; state.detailRecord = null; }
         if (id === "seizure-modal") seizureTargetRecord = null;
       }
     });
@@ -1357,6 +1407,6 @@
     if (!$("#confirm-modal").hidden) closeConfirm(false);
     else if (!$("#seizure-modal").hidden) { $("#seizure-modal").hidden = true; seizureTargetRecord = null; }
     else if (!$("#override-modal").hidden) $("#override-modal").hidden = true;
-    else if (!$("#detail-modal").hidden) { $("#detail-modal").hidden = true; state.detailId = null; }
+    else if (!$("#detail-modal").hidden) closeDetail();
   });
 })();

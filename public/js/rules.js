@@ -4,7 +4,6 @@
  * Output: an ordered list of check results with exact clause citations.
  *
  * This layer is pure and deterministic: same extraction, same verdict, every time.
- * The AI never decides compliance; it only reads the label.
  */
 
 const STATUS = {

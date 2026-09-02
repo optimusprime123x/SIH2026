@@ -22,6 +22,26 @@
       .replace(/[^\x00-\xFF]/g, "")
       .replace(/\s{2,}/g, " ");
 
+  /** Evidence photos are data URLs on a live scan but R2 URLs on a saved
+   *  record — jsPDF needs bytes, so resolve URLs to data URLs first. */
+  async function loadImageData(src) {
+    if (!src || src.startsWith("data:")) return src || null;
+    const blob = await (await fetch(src)).blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+  async function loadThumbs(record, max) {
+    const out = [];
+    for (const src of (record.thumbs || []).slice(0, max)) {
+      try { out.push(await loadImageData(src)); } catch { /* skip unreadable photo */ }
+    }
+    return out.filter(Boolean);
+  }
+
   const STATUS_LABEL = {
     pass: "COMPLIANT",
     violation: "VIOLATION",
@@ -43,7 +63,8 @@
     return SAFFRON;
   }
 
-  function exportPdf(record) {
+  async function exportPdf(record) {
+    const thumbs = await loadThumbs(record, 5);
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit: "mm", format: "a4" });
     const W = doc.internal.pageSize.getWidth();
@@ -185,7 +206,7 @@
     y += 4;
 
     // ---- evidence thumbnails ----
-    if (record.thumbs?.length) {
+    if (thumbs.length) {
       if (y > 230) { doc.addPage(); y = 20; }
       doc.setFont("helvetica", "bold");
       doc.setFontSize(10.5);
@@ -194,7 +215,7 @@
       y += 4;
       let x = M;
       const th = 34, tw = 34;
-      for (const thumb of record.thumbs.slice(0, 5)) {
+      for (const thumb of thumbs) {
         try {
           doc.addImage(thumb, "JPEG", x, y, tw, th, undefined, "FAST");
           doc.setDrawColor(...MUTED);
@@ -240,7 +261,8 @@
    * Legal Metrology Act, 2009. Every statutory reference is a starting point
    * for the officer to verify against the current Act and Rules before service.
    */
-  function exportSeizureNotice(record, formData) {
+  async function exportSeizureNotice(record, formData) {
+    const thumbs = await loadThumbs(record, 3);
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit: "mm", format: "a4" });
     const W = doc.internal.pageSize.getWidth();
@@ -512,7 +534,7 @@ You are called upon to SHOW CAUSE within ${noticeDays} DAYS of receipt of this n
     // ==========================================
     // PAGE 3: PHOTOGRAPHIC EVIDENCE ANNEXURE
     // ==========================================
-    if (record.thumbs?.length) {
+    if (thumbs.length) {
       doc.addPage();
       doc.setFillColor(...NAVY);
       doc.rect(0, 0, W, 22, "F");
@@ -535,7 +557,7 @@ You are called upon to SHOW CAUSE within ${noticeDays} DAYS of receipt of this n
 
       let x = M;
       const imgH = 50, imgW = 50;
-      for (const thumb of record.thumbs.slice(0, 3)) {
+      for (const thumb of thumbs) {
         try {
           doc.addImage(thumb, "JPEG", x, y, imgW, imgH, undefined, "FAST");
           doc.setDrawColor(...MUTED);

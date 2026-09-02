@@ -1,8 +1,13 @@
 /**
  * LMPC Compliance Checker — Cloudflare Worker backend.
  * Serves static assets (via the assets binding) and exposes:
- *   POST /api/scan   — forwards package images to Gemini, returns structured label extraction
- *   GET  /api/health — reports whether a Gemini key is configured
+ *   POST   /api/scan                 — forwards package images to Gemini, returns structured label extraction
+ *   GET    /api/health               — reports whether a Gemini key is configured
+ *   GET    /api/barcode/:gtin        — Open Food Facts product lookup
+ *   GET    /api/inspections[?q=]     — repository list (D1)        POST /api/inspections — save (images → R2)
+ *   GET/PUT/DELETE /api/inspections/:id, DELETE /api/inspections   — read / update / delete / clear
+ *   GET    /api/stats                — dashboard aggregates (D1)
+ *   GET    /api/images/:id/:n.jpg    — evidence photo (R2, 512px)
  *
  * The worker only EXTRACTS label data. Compliance is decided by the
  * deterministic rules engine on the client (public/js/rules.js).
@@ -11,8 +16,7 @@
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const API_REVISION = "2026-05-20";
-const APP_PASSWORD = "SIH2026"; // prototype-only shared password
-
+const APP_PASSWORD = "SIH2026"; 
 /** A declaration field: verbatim text + found flag + bounding box & image index. */
 const decl = (extra = {}) => ({
   type: "object",
@@ -344,6 +348,176 @@ async function handleScan(request, env) {
   return json({ ok: true, mock: false, model: GEMINI_MODEL, extraction });
 }
 
+// ============================== inspection repository (D1 + R2) ==============================
+
+const effectiveStatus = (r) => r?.resolution?.status ?? r?.status;
+const imageKey = (id, n) => `inspections/${id}/${n}.jpg`;
+const imageUrl = (id, n) => `/api/images/${id}/${n}.jpg`;
+const ID_RE = /^[A-Z0-9-]{6,40}$/;
+
+/** D1 row → the record shape the frontend renders. Images are R2 URLs. */
+function rowToRecord(row) {
+  return {
+    id: row.id, ts: row.ts, role: row.role, model: row.model, mock: Boolean(row.mock),
+    extraction: JSON.parse(row.extraction_json),
+    results: JSON.parse(row.results_json),
+    verdict: row.verdict_json ? JSON.parse(row.verdict_json) : { verdict: row.verdict, summary: row.summary, counts: {} },
+    override: row.override_json ? JSON.parse(row.override_json) : null,
+    barcodes: row.barcodes_json ? JSON.parse(row.barcodes_json) : [],
+    thumbs: Array.from({ length: row.image_count ?? 0 }, (_, n) => imageUrl(row.id, n)),
+  };
+}
+
+/** Rewrite the per-clause violation rows (effective statuses, incl. inspector resolutions). */
+async function writeViolations(env, id, results) {
+  const stmts = [env.DB.prepare("DELETE FROM violations WHERE inspection_id = ?").bind(id)];
+  for (const r of results || []) {
+    const status = effectiveStatus(r);
+    if (status !== "violation" && status !== "missing") continue;
+    stmts.push(
+      env.DB.prepare("INSERT INTO violations (inspection_id, check_id, clause, title, status, severity) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(id, r.id, r.clause, r.title ?? null, status, r.severity ?? null)
+    );
+  }
+  await env.DB.batch(stmts);
+}
+
+async function deleteImages(env, id, count) {
+  const keys = Array.from({ length: count ?? 0 }, (_, n) => imageKey(id, n));
+  if (keys.length) await env.EVIDENCE.delete(keys);
+}
+
+async function handleInspections(request, env, url) {
+  const parts = url.pathname.split("/").filter(Boolean); // ["api", "inspections", id?]
+  const id = parts[2] ? decodeURIComponent(parts[2]) : null;
+  const method = request.method;
+  const LIST_COLS = "id, ts, role, mock, brand, product, final_verdict, (override_json IS NOT NULL) AS overridden, image_count";
+
+  if (!id && method === "GET") {
+    const q = (url.searchParams.get("q") || "").trim();
+    const like = `%${q}%`;
+    const stmt = q
+      ? env.DB.prepare(`SELECT ${LIST_COLS} FROM inspections WHERE id LIKE ? OR brand LIKE ? OR product LIKE ? OR gtin LIKE ? ORDER BY ts DESC LIMIT 200`).bind(like, like, like, like)
+      : env.DB.prepare(`SELECT ${LIST_COLS} FROM inspections ORDER BY ts DESC LIMIT 200`);
+    const { results } = await stmt.all();
+    return json({
+      ok: true,
+      inspections: results.map((r) => ({
+        id: r.id, ts: r.ts, role: r.role, mock: Boolean(r.mock), brand: r.brand, product: r.product,
+        finalVerdict: r.final_verdict, overridden: Boolean(r.overridden),
+        thumb: r.image_count > 0 ? imageUrl(r.id, 0) : null,
+      })),
+    });
+  }
+
+  if (!id && method === "POST") {
+    const rec = await request.json();
+    if (!rec?.id || !rec.extraction || !Array.isArray(rec.results) || !rec.verdict?.verdict) {
+      return json({ ok: false, error: "Incomplete record." }, 400);
+    }
+    if (!ID_RE.test(rec.id)) return json({ ok: false, error: "Bad record id." }, 400);
+    const images = Array.isArray(rec.images) ? rec.images.slice(0, 5) : [];
+    for (let n = 0; n < images.length; n++) {
+      const b64 = String(images[n]).replace(/^data:image\/\w+;base64,/, "");
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      await env.EVIDENCE.put(imageKey(rec.id, n), bytes, { httpMetadata: { contentType: "image/jpeg" } });
+    }
+    const p = rec.extraction.product || {};
+    const gtin = (rec.barcodes || []).map((b) => String(b?.value ?? "")).find((v) => /^\d{8,14}$/.test(v)) ?? null;
+    const finalVerdict = rec.override?.verdict ?? rec.verdict.verdict;
+    await env.DB.prepare(
+      `INSERT INTO inspections (id, ts, role, model, mock, brand, product, category, gtin, verdict, final_verdict, summary,
+         override_json, extraction_json, results_json, verdict_json, barcodes_json, image_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(
+      rec.id, rec.ts || new Date().toISOString(), rec.role ?? null, rec.model ?? null, rec.mock ? 1 : 0,
+      p.brand_name ?? null, p.product_description ?? null, p.category ?? null, gtin,
+      rec.verdict.verdict, finalVerdict, rec.verdict.summary ?? null,
+      rec.override ? JSON.stringify(rec.override) : null,
+      JSON.stringify(rec.extraction), JSON.stringify(rec.results), JSON.stringify(rec.verdict),
+      JSON.stringify(rec.barcodes || []), images.length
+    ).run();
+    await writeViolations(env, rec.id, rec.results);
+    return json({ ok: true, id: rec.id, thumbs: images.map((_, n) => imageUrl(rec.id, n)) });
+  }
+
+  if (!id && method === "DELETE") {
+    const { results } = await env.DB.prepare("SELECT id, image_count FROM inspections").all();
+    for (const r of results) await deleteImages(env, r.id, r.image_count);
+    await env.DB.batch([env.DB.prepare("DELETE FROM violations"), env.DB.prepare("DELETE FROM inspections")]);
+    return json({ ok: true, deleted: results.length });
+  }
+
+  if (!id) return json({ ok: false, error: "Method not allowed." }, 405);
+  if (!ID_RE.test(id)) return json({ ok: false, error: "Bad record id." }, 400);
+
+  const row = await env.DB.prepare("SELECT * FROM inspections WHERE id = ?").bind(id).first();
+  if (!row) return json({ ok: false, error: "Inspection not found." }, 404);
+
+  if (method === "GET") return json({ ok: true, inspection: rowToRecord(row) });
+
+  if (method === "PUT") {
+    const patch = await request.json();
+    const results = Array.isArray(patch.results) ? patch.results : JSON.parse(row.results_json);
+    const verdict = patch.verdict?.verdict
+      ? patch.verdict
+      : (row.verdict_json ? JSON.parse(row.verdict_json) : { verdict: row.verdict, summary: row.summary, counts: {} });
+    const override = patch.override === undefined
+      ? (row.override_json ? JSON.parse(row.override_json) : null)
+      : patch.override;
+    await env.DB.prepare(
+      `UPDATE inspections SET results_json = ?, verdict_json = ?, verdict = ?, summary = ?, override_json = ?, final_verdict = ?,
+         updated_at = datetime('now') WHERE id = ?`
+    ).bind(
+      JSON.stringify(results), JSON.stringify(verdict), verdict.verdict, verdict.summary ?? null,
+      override ? JSON.stringify(override) : null, override?.verdict ?? verdict.verdict, id
+    ).run();
+    await writeViolations(env, id, results);
+    return json({ ok: true });
+  }
+
+  if (method === "DELETE") {
+    await deleteImages(env, id, row.image_count);
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM violations WHERE inspection_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM inspections WHERE id = ?").bind(id),
+    ]);
+    return json({ ok: true });
+  }
+
+  return json({ ok: false, error: "Method not allowed." }, 405);
+}
+
+async function handleStats(env) {
+  const [totals, byVerdict, topClauses] = await Promise.all([
+    env.DB.prepare(
+      `SELECT COUNT(*) AS total, SUM(final_verdict = 'COMPLIANT') AS compliant, SUM(override_json IS NOT NULL) AS overrides,
+         (SELECT COUNT(*) FROM violations) AS violations FROM inspections`
+    ).first(),
+    env.DB.prepare("SELECT final_verdict AS verdict, COUNT(*) AS count FROM inspections GROUP BY final_verdict").all(),
+    env.DB.prepare("SELECT clause, MIN(title) AS title, COUNT(*) AS count FROM violations GROUP BY clause ORDER BY count DESC LIMIT 6").all(),
+  ]);
+  return json({
+    ok: true,
+    stats: {
+      total: totals?.total ?? 0, compliant: totals?.compliant ?? 0,
+      overrides: totals?.overrides ?? 0, violations: totals?.violations ?? 0,
+      byVerdict: byVerdict.results, topClauses: topClauses.results,
+    },
+  });
+}
+
+/** Evidence photos are served straight from R2 (no auth — <img> tags cannot send headers). */
+async function handleImage(env, url) {
+  const m = url.pathname.match(/^\/api\/images\/([A-Z0-9-]+)\/(\d+)\.jpg$/);
+  if (!m) return json({ ok: false, error: "Not found." }, 404);
+  const obj = await env.EVIDENCE.get(imageKey(m[1], Number(m[2])));
+  if (!obj) return json({ ok: false, error: "Not found." }, 404);
+  return new Response(obj.body, {
+    headers: { "content-type": "image/jpeg", "cache-control": "public, max-age=31536000, immutable", etag: obj.httpEtag },
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -358,6 +532,17 @@ export default {
         if (url.pathname === "/api/scan") {
           if (request.method !== "POST") return json({ ok: false, error: "POST only." }, 405);
           return await handleScan(request, env);
+        }
+        if (url.pathname.startsWith("/api/images/")) {
+          return await handleImage(env, url);
+        }
+        if (url.pathname === "/api/inspections" || url.pathname.startsWith("/api/inspections/")) {
+          if (request.headers.get("x-lmpc-auth") !== APP_PASSWORD) return json({ ok: false, error: "Not authorised." }, 401);
+          return await handleInspections(request, env, url);
+        }
+        if (url.pathname === "/api/stats") {
+          if (request.headers.get("x-lmpc-auth") !== APP_PASSWORD) return json({ ok: false, error: "Not authorised." }, 401);
+          return await handleStats(env);
         }
         if (url.pathname.startsWith("/api/barcode/")) {
           if (request.headers.get("x-lmpc-auth") !== APP_PASSWORD) return json({ ok: false, error: "Not authorised." }, 401);

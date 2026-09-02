@@ -815,6 +815,7 @@ textarea.metro-input { resize: vertical; }
 
 /* ---------- history ---------- */
 
+.history-search { margin-top: 14px; }
 .history-list { margin-top: 12px; }
 .history-row {
   display: grid;

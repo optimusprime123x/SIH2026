@@ -1,10 +1,12 @@
 # LMPC Compliance Checker — TODO
 
-## Blocked on D1/R2 storage (do these after the database lands)
+## Storage
 
-- [ ] **D1 database** — move scan repository out of localStorage: tables for users, products, inspections (extraction JSON, results, verdict, override log), violations. Multi-device history + real role-based auth (worker-issued session token instead of the shared `SIH2026` password and self-asserted admin role).
-- [ ] **R2 evidence storage** — upload the full-resolution photos per inspection (localStorage only holds 320px thumbs today); reports should link the originals.
-- [ ] **History search + filter** — PS requires "search and retrieval facility": search box (brand / report ID / barcode) + verdict filter chips over the repository. Trivial over localStorage but better done once against D1 queries.
+- [x] **D1 database** — DONE: `lmpc-db` holds `inspections` + `violations`; worker exposes `/api/inspections` (list/save/read/update/delete) and `/api/stats` (SQL-aggregated dashboard). Scans saved on one device appear on every device. Legacy localStorage records are imported automatically on first login.
+- [x] **R2 evidence storage** — DONE: `lmpc-evidence` stores each photo at 512px as `inspections/{id}/{n}.jpg`, served through `/api/images/...`; deleting an inspection removes its objects. (512px is deliberate — full-resolution phone photos would blow through the free tier, and 512px is what the overlay and PDFs need.)
+- [x] **History search** — DONE: debounced search box over brand / product / report ID / barcode, matched in SQL.
+- [ ] **Verdict filter chips** on history (search is done; filtering by verdict is not).
+- [ ] **Real role-based auth** — worker-issued session token per user instead of the shared `SIH2026` password and the self-asserted admin role. D1 `users` table.
 - [ ] **Editable export** — PS requires "PDF **and editable formats**": CSV export of all scans + per-report .doc (styled HTML saved as `.doc` opens in Word) or real docx.
 
 ## Features (independent of storage)

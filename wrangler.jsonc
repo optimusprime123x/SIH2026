@@ -9,9 +9,23 @@
   },
   "observability": {
     "enabled": true
-  }
-  // Later: add R2 bucket (evidence images) and D1 (scan repository) bindings here.
-  //
+  },
+  // Inspection repository (schema in ./migrations — apply with `wrangler d1 migrations apply lmpc-db`)
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lmpc-db",
+      "database_id": "89302c1a-d8b4-41e3-8f3b-f0cf474ac3e7",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Evidence photos, stored at 512px as inspections/{id}/{n}.jpg
+  "r2_buckets": [
+    {
+      "binding": "EVIDENCE",
+      "bucket_name": "lmpc-evidence"
+    }
+  ]
   // Secrets — the worker rotates across ALL of these (any subset works):
   //   wrangler secret put GEMINI_API_KEY1
   //   wrangler secret put GEMINI_API_KEY2
