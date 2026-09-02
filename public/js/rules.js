@@ -262,6 +262,170 @@ function parseDeclaredUSP(text) {
   };
 }
 
+// --- Rule 7 — letter / numeral height -----------------------------------------
+// Table-I as substituted by the 2017 amendment (GSR 629(E), effective 1 Jan 2018):
+// minimum height of numerals and letters by principal-display-panel area.
+const HEIGHT_TABLE = [
+  { maxArea: 50,       normal: 1.0, moulded: 1.5 },
+  { maxArea: 100,      normal: 1.5, moulded: 3.0 },
+  { maxArea: 500,      normal: 2.5, moulded: 4.0 },
+  { maxArea: 2500,     normal: 4.0, moulded: 6.0 },
+  { maxArea: Infinity, normal: 6.0, moulded: 6.0 },
+];
+const tableRow = (areaCm2) => HEIGHT_TABLE.findIndex((r) => areaCm2 <= r.maxArea);
+const requiredHeightMm = (areaCm2, moulded) => {
+  const row = HEIGHT_TABLE[tableRow(areaCm2)];
+  return moulded ? row.moulded : row.normal;
+};
+// A photo has no absolute scale, but glyph-height ÷ √(panel-area) is scale-free,
+// and Table-I pins that ratio to a narrow band — so a photo alone can often decide.
+const requiredRatio = (areaCm2, moulded) => requiredHeightMm(areaCm2, moulded) / (10 * Math.sqrt(areaCm2));
+
+/** Plausible principal-display-panel area (cm²) implied by the declared net quantity. */
+function plausibleAreaRange(netQty) {
+  const unitRaw = norm(netQty?.unit).replace(/\.$/, "");
+  const unit = NON_STANDARD_UNITS[unitRaw] || SPELLED_OUT_UNITS[unitRaw] || unitRaw;
+  const v = typeof netQty?.value === "number" ? netQty.value : null;
+  if (!v || v <= 0) return [20, 5000];
+  let vMin, vMax; // package volume band in cm³
+  if (["g", "kg", "mg"].includes(unit)) {
+    const grams = unit === "kg" ? v * 1000 : unit === "mg" ? v / 1000 : v;
+    vMin = grams / 1.5; vMax = grams / 0.4;           // packaged-goods bulk density 0.4–1.5 g/cm³
+  } else if (["ml", "l", "cl"].includes(unit)) {
+    const ml = unit === "l" ? v * 1000 : unit === "cl" ? v * 10 : v;
+    vMin = ml; vMax = ml * 1.3;                         // headspace / container walls
+  } else {
+    return [20, 5000];
+  }
+  // a face is 1× V^(2/3) for a cube-ish box up to ~5× for a flat pouch
+  return [Math.max(10, Math.pow(vMin, 2 / 3)), Math.min(10000, Math.pow(vMax, 2 / 3) * 5)];
+}
+
+/** Extremes of the required ratio across an area range (the function falls inside
+ *  each bracket and jumps at each boundary, so probe range ends + boundaries). */
+function requiredRatioRange([aMin, aMax], moulded) {
+  const probes = [aMin, aMax];
+  for (const row of HEIGHT_TABLE) {
+    if (row.maxArea > aMin && row.maxArea < aMax) probes.push(row.maxArea, row.maxArea + 1e-6);
+  }
+  const vals = probes.map((a) => requiredRatio(a, moulded));
+  return { min: Math.min(...vals), max: Math.max(...vals) };
+}
+
+/** Smallest plausible panel area at which an observed ratio satisfies Table-I. */
+function minCompliantArea(ratio, [aMin, aMax], moulded) {
+  let best = null, low = 0;
+  for (const row of HEIGHT_TABLE) {
+    const h = moulded ? row.moulded : row.normal;
+    const a = Math.max(Math.pow(h / (10 * ratio), 2), low + 1e-6, aMin);
+    if (a <= row.maxArea && a <= aMax && (best === null || a < best)) best = a;
+    low = row.maxArea;
+  }
+  return best;
+}
+
+/**
+ * Rule 7(2)–(3) letter-height check. Uses Gemini's tight glyph boxes for the
+ * net quantity / MRP / date digits against the principal-display-panel box.
+ * With `panelCm` ({w, h} in cm — height × circumference for cylinders) the
+ * verdict is exact; without it, a band verdict from the scale-free ratio.
+ * Lenient by design: uncertain or close cases pass; only clear shortfalls fail.
+ */
+function assessLetterHeight(extraction, panelCm = null) {
+  const c = check("font-size", "Placement, size & legibility — Rules 7–9", "Rule 7(2)–(3)", "Minimum letter / numeral height",
+    "Numerals and letters of every mandatory declaration must meet the Table-I minimum for the panel area (1–6 mm); width ≥ ⅓ height except 1, i, I, l.");
+  const d = extraction?.declarations ?? {};
+  const panel = extraction?.principal_display_panel;
+  const dims = extraction?.image_dims?.[panel?.image_index ?? 0];
+
+  const measured = [];
+  if (panel?.box_2d?.length === 4 && dims?.w > 0 && dims?.h > 0) {
+    const [py0, px0, py1, px1] = panel.box_2d;
+    const panelPx = Math.sqrt(((px1 - px0) / 1000) * dims.w * ((py1 - py0) / 1000) * dims.h);
+    for (const [key, label] of [["net_quantity", "Net quantity"], ["mrp", "MRP"], ["mfg_date", "Date"]]) {
+      const g = d[key];
+      if (!g?.found || !(g.glyph_box_2d?.length === 4) || (g.image_index ?? 0) !== (panel.image_index ?? 0)) continue;
+      const [y0, x0, y1, x1] = g.glyph_box_2d;
+      const hPx = ((y1 - y0) / 1000) * dims.h, wPx = ((x1 - x0) / 1000) * dims.w;
+      if (!(hPx > 0) || !(panelPx > 0)) continue;
+      measured.push({
+        key, label, ratio: hPx / panelPx, moulded: Boolean(g.is_moulded),
+        charAspect: g.glyph_char_count > 1 ? (wPx / g.glyph_char_count) / hPx : null,
+      });
+    }
+  }
+
+  if (!measured.length) {
+    c.status = STATUS.REVIEW; c.manual = true;
+    c.findings.push("Letter height could not be measured from these photographs (panel or digit boxes unavailable) — check the numerals against Table-I on the physical pack.");
+    return c;
+  }
+
+  const areaRange = plausibleAreaRange(d.net_quantity);
+  const measure = { measured: [], areaRange, shape: panel.shape ?? "rectangular_face", viewingAngle: panel.viewing_angle ?? null, panelCm: null, areaCm2: null, row: null };
+  c.extracted = measured.map((m) => `${m.label} digits ≈ ${(m.ratio * 100).toFixed(2)}% of √panel-area`).join(" · ");
+
+  let failed = false, uncertain = false;
+  const validPanel = panelCm && panelCm.w > 0 && panelCm.h > 0;
+  if (validPanel) {
+    // Exact: the inspector measured the panel. Rule 7(4): W×H for a face, 40% × H × circumference for cylinders.
+    const area = measure.shape === "cylinder" ? 0.4 * panelCm.w * panelCm.h : panelCm.w * panelCm.h;
+    measure.panelCm = { w: panelCm.w, h: panelCm.h };
+    measure.areaCm2 = area;
+    measure.row = tableRow(area) + 1;
+    // Deliberately lenient: box edges carry ±1 px at Gemini's 0–1000 precision,
+    // so a 15% allowance is applied in the trader's favour.
+    for (const m of measured) {
+      const hMm = m.ratio * Math.sqrt(area) * 10;
+      const needMm = requiredHeightMm(area, m.moulded);
+      const ok = hMm >= needMm * 0.85;
+      if (!ok) failed = true;
+      measure.measured.push({ label: m.label, ratio: m.ratio, hMm, needMm, ok, charAspect: m.charAspect });
+      c.findings.push(`${m.label} digits ≈ ${hMm.toFixed(1)} mm against a ${needMm.toFixed(1)} mm minimum (panel ${Math.round(area)} cm², Table-I row ${measure.row}${m.moulded ? ", moulded lettering" : ""}) — ${ok ? "complies" : "TOO SMALL"}.`);
+    }
+    c.findings.push("Heights are derived from the photographed proportions with a 15% measurement allowance in the trader's favour.");
+  } else {
+    // No absolute scale: judge from the scale-free ratio, erring on the side of PASS.
+    for (const m of measured) {
+      const { min, max } = requiredRatioRange(areaRange, m.moulded);
+      const pct = (m.ratio * 100).toFixed(2);
+      const rangeTxt = `${Math.round(areaRange[0])}–${Math.round(areaRange[1])} cm²`;
+      if (m.ratio >= max * 0.85) {
+        measure.measured.push({ label: m.label, ratio: m.ratio, ok: true, charAspect: m.charAspect });
+        c.findings.push(`${m.label} digits are ${pct}% of the panel's √area — meets Table-I for every plausible panel size (${rangeTxt} for this pack).`);
+      } else if (m.ratio < min * 0.8) {
+        failed = true;
+        measure.measured.push({ label: m.label, ratio: m.ratio, ok: false, charAspect: m.charAspect });
+        c.findings.push(`${m.label} digits are only ${pct}% of the panel's √area — clearly below the Table-I minimum even if the panel were as large as ${Math.round(areaRange[1])} cm². Enter the panel size to confirm.`);
+      } else {
+        // Borderline from the photo alone — treated as likely compliant.
+        const aStar = minCompliantArea(m.ratio, areaRange, m.moulded);
+        measure.measured.push({ label: m.label, ratio: m.ratio, ok: null, minArea: aStar, charAspect: m.charAspect });
+        const condition = aStar
+          ? `it holds if the panel is at least ${Math.round(aStar)} cm² (about ${Math.sqrt(aStar).toFixed(0)} × ${Math.sqrt(aStar).toFixed(0)} cm)`
+          : `it sits within the measurement allowance of the Table-I minimum for a panel around ${Math.round(areaRange[1])} cm²`;
+        c.findings.push(`${m.label} digits are ${pct}% of the panel's √area — likely compliant (estimate); ${condition}. Enter the panel size for an exact figure.`);
+      }
+    }
+    if (panel.viewing_angle === "strongly_angled") {
+      c.findings.push("The panel is photographed at a strong angle, which distorts size ratios — treat these figures as rough; re-shoot straight-on or enter the panel size.");
+      if (failed) { failed = false; uncertain = true; } // never convict from a distorted photo
+    }
+  }
+
+  // Rule 7(3): average glyph width ≥ ⅓ of height. Character-average width is a
+  // rough proxy (1/i/I/l are exempt anyway), so this is noted, not enforced.
+  for (const m of measured.filter((x) => x.charAspect !== null && x.charAspect < 0.25)) {
+    c.findings.push(`${m.label} digits average ${(m.charAspect * 100).toFixed(0)}% of their height in width — Rule 7(3) requires at least one-third; check for a condensed typeface on the physical pack.`);
+  }
+
+  c.measure = measure;
+  if (failed) { c.status = STATUS.VIOLATION; c.severity = "major"; }
+  else if (uncertain) { c.status = STATUS.REVIEW; c.manual = true; }
+  else { c.status = STATUS.PASS; }
+  return c;
+}
+
 /** Main entry: extraction JSON -> array of check results. */
 function runRulesEngine(extraction) {
   const d = extraction?.declarations ?? {};
@@ -775,16 +939,9 @@ function runRulesEngine(extraction) {
     results.push(c);
   }
 
-  // ---- Rule 7(2) — Minimum letter height -------------------------------------
-  {
-    const c = check("font-size", G3, "Rule 7(2)–(3)", "Minimum letter / numeral height",
-      "Minimum heights (1–6 mm) apply based on principal display panel area; width ≥ ⅓ height.");
-    c.extracted = null;
-    c.status = STATUS.REVIEW;
-    c.manual = true; // pending physical calibration — must not block a COMPLIANT verdict
-    c.findings.push("Millimetre-accurate measurement needs physical scale calibration (₹10 coin / standard card feature — planned). Prototype gives no automated verdict on letter height.");
-    results.push(c);
-  }
+  // ---- Rule 7(2)–(3) — Minimum letter height (scale-free ratio; exact once the
+  //      inspector enters the panel size) ------------------------------------------
+  results.push(assessLetterHeight(extraction, null));
 
   // ---- Rule 26(a) — small-package exemption ----------------------------------
   // Packages of 10 g / 10 ml or less are exempt from the declaration regime
@@ -882,5 +1039,7 @@ window.LMPCRules = {
   effectiveStatus,
   computeExpectedUSP,
   parseDeclaredUSP,
+  assessLetterHeight,
+  requiredHeightMm,
   STATUS,
 };

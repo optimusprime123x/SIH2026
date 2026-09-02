@@ -37,6 +37,18 @@ const decl = (extra = {}) => ({
   required: ["found", "text", "box_2d", "image_index", ...Object.keys(extra)],
 });
 
+/** Rule 7 letter-height measurement: a tight box around one line of the key digits
+ *  (never rendered — used only for the size ratio against the display panel). */
+const GLYPH_FIELDS = {
+  glyph_box_2d: {
+    type: ["array", "null"],
+    items: { type: "integer" },
+    description: "TIGHT box [ymin, xmin, ymax, xmax] normalized 0-1000 around ONE line of the key digits only (quantity digits / price digits / date digits), from the top of the tallest glyph to its bottom — no labels, no other lines, no padding. Null if not found.",
+  },
+  glyph_char_count: { type: ["integer", "null"], description: "Number of characters inside glyph_box_2d (digits/letters only, no spaces)." },
+  is_moulded: { type: "boolean", description: "True if this text is blown, formed, moulded or embossed into the container surface rather than printed." },
+};
+
 const EXTRACTION_SCHEMA = {
   type: "object",
   properties: {
@@ -68,14 +80,17 @@ const EXTRACTION_SCHEMA = {
           value: { type: ["number", "null"], description: "Numeric quantity, e.g. 500 for '500 gms'." },
           unit: { type: ["string", "null"], description: "The unit EXACTLY as printed, e.g. 'gms', 'Kg', 'ml', 'N'." },
           qualifying_words: { type: ["string", "null"], description: "Any qualifying words printed near the quantity like 'about', 'approx', 'minimum', else null." },
+          ...GLYPH_FIELDS,
         }),
         mrp: decl({
           value: { type: ["number", "null"], description: "Numeric MRP value." },
           currency: { type: ["string", "null"], description: "Currency symbol/word EXACTLY as printed: '₹', 'Rs.', 'INR', '$', etc." },
           tax_inclusive_text: { type: ["string", "null"], description: "The verbatim phrase indicating taxes included, e.g. 'inclusive of all taxes', 'incl. of all taxes', else null." },
+          ...GLYPH_FIELDS,
         }),
         mfg_date: decl({
           date_kind: { type: "string", enum: ["manufacture", "packing", "import", "unknown"], description: "Whether the date is labelled Mfd/Mfg (manufacture), Pkd (packing) or import." },
+          ...GLYPH_FIELDS,
         }),
         best_before: decl(),
         consumer_care: decl({
@@ -139,13 +154,24 @@ const EXTRACTION_SCHEMA = {
       type: ["integer", "null"],
       description: "0-based index of the image where the barcode is visible, or null.",
     },
+    principal_display_panel: {
+      type: "object",
+      description: "The package face that carries the declarations — its physical edges in the photo where it is best seen.",
+      properties: {
+        box_2d: { type: ["array", "null"], items: { type: "integer" }, description: "Box [ymin, xmin, ymax, xmax] normalized 0-1000 around the pack's printed face (the physical edges of the package, NOT the whole photo). Null if the face is not fully visible." },
+        image_index: { type: ["integer", "null"], description: "0-based index of the image the box refers to." },
+        shape: { type: "string", enum: ["rectangular_face", "cylinder", "other"], description: "rectangular_face for pouches/boxes/sachets, cylinder for cans/bottles/jars." },
+        viewing_angle: { type: "string", enum: ["straight_on", "slightly_angled", "strongly_angled"] },
+      },
+      required: ["box_2d", "image_index", "shape", "viewing_angle"],
+    },
     label_legibility: { type: "string", enum: ["good", "partial", "poor"], description: "How readable the photographed label is." },
     notes: { type: ["string", "null"], description: "Anything unusual an inspector should know (stickers over declarations, damaged label, etc.)." },
   },
   required: [
     "product", "declarations", "languages_detected",
     "barcode_visible", "barcode_digits", "barcode_box_2d", "barcode_image_index",
-    "label_legibility", "notes",
+    "principal_display_panel", "label_legibility", "notes",
   ],
 };
 
@@ -167,7 +193,9 @@ STRICT RULES:
 - unit_sale_price is a per-unit price like "₹0.85/g" if printed.
 - mfg_date is the month/year (or full date) declaration; record in "date_kind" whether it is labelled as manufacture (Mfd/Mfg), packing (Pkd) or import. best_before is a "best before / use by / expiry" declaration.
 - gm_declaration: any "GM" genetically-modified marking. sticker_over_declaration: whether any sticker is pasted over/altering mandatory declarations, and whether it covers the printed MRP.
-- barcode_digits: if a barcode is visible, transcribe the digits printed beneath it exactly (no spaces) and provide barcode_box_2d & barcode_image_index.`;
+- barcode_digits: if a barcode is visible, transcribe the digits printed beneath it exactly (no spaces) and provide barcode_box_2d & barcode_image_index.
+- principal_display_panel: the box around the package FACE that carries the declarations — the pack's physical edges in that photo, not the photo frame — with its shape and the camera angle.
+- For net_quantity, mrp and mfg_date also give glyph_box_2d: a TIGHT box around ONE line of the key digits only (the quantity digits, the price digits, the date digits) from the top of the tallest glyph to its bottom — exclude labels like "MRP" or "Net Wt", other lines and any padding — plus glyph_char_count and is_moulded.`;
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -214,9 +242,9 @@ const MOCK_EXTRACTION = {
     importer: { found: false, text: null, box_2d: null, image_index: null },
     country_of_origin: { found: false, text: null, box_2d: null, image_index: null },
     generic_name: { found: true, text: "Instant Coffee Powder", is_brand_only: false, box_2d: [280, 200, 360, 800], image_index: 0 },
-    net_quantity: { found: true, text: "Net Wt. 100 gms", value: 100, unit: "gms", qualifying_words: null, box_2d: [480, 250, 540, 750], image_index: 0 },
-    mrp: { found: true, text: "MRP Rs. 245.00", value: 245, currency: "Rs.", tax_inclusive_text: null, box_2d: [550, 250, 610, 750], image_index: 0 },
-    mfg_date: { found: true, text: "Pkd. 05/2026", date_kind: "packing", box_2d: [410, 250, 470, 750], image_index: 0 },
+    net_quantity: { found: true, text: "Net Wt. 100 gms", value: 100, unit: "gms", qualifying_words: null, box_2d: [480, 250, 540, 750], image_index: 0, glyph_box_2d: [492, 420, 528, 520], glyph_char_count: 3, is_moulded: false },
+    mrp: { found: true, text: "MRP Rs. 245.00", value: 245, currency: "Rs.", tax_inclusive_text: null, box_2d: [550, 250, 610, 750], image_index: 0, glyph_box_2d: [562, 430, 598, 600], glyph_char_count: 6, is_moulded: false },
+    mfg_date: { found: true, text: "Pkd. 05/2026", date_kind: "packing", box_2d: [410, 250, 470, 750], image_index: 0, glyph_box_2d: [425, 380, 455, 560], glyph_char_count: 7, is_moulded: false },
     best_before: { found: true, text: "Best before 18 months from packaging", box_2d: [440, 150, 490, 850], image_index: 0 },
     consumer_care: { found: true, text: "For complaints: care@hillfresh.in", has_phone: false, has_email: true, has_address: false, box_2d: [790, 150, 850, 850], image_index: 0 },
     unit_sale_price: { found: false, text: null, box_2d: null, image_index: null },
@@ -230,6 +258,7 @@ const MOCK_EXTRACTION = {
   barcode_digits: "8901234567895",
   barcode_box_2d: [820, 650, 950, 920],
   barcode_image_index: 0,
+  principal_display_panel: { box_2d: [120, 100, 960, 900], image_index: 0, shape: "cylinder", viewing_angle: "straight_on" },
   label_legibility: "good",
   notes: "MOCK DATA — no GEMINI_API_KEY configured in .dev.vars, so this is a built-in sample label used to demo the pipeline.",
 };

@@ -154,7 +154,8 @@
         const big = drawScaled(img, 1600);
         const thumb = drawScaled(big, 512).toDataURL("image/jpeg", 0.8);
         URL.revokeObjectURL(url);
-        resolve({ apiData: big.toDataURL("image/jpeg", 0.87).split(",")[1], thumb });
+        // width/height let the rules engine turn Gemini's 0–1000 boxes back into pixels
+        resolve({ apiData: big.toDataURL("image/jpeg", 0.87).split(",")[1], thumb, width: big.width, height: big.height });
       };
       img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("decode failed")); };
       img.src = url;
@@ -341,6 +342,7 @@
     const evidence = {
       payload: state.images.map((img) => ({ data: img.apiData, mimeType: "image/jpeg" })),
       thumbs: state.images.map((img) => img.thumb),
+      dims: state.images.map((img) => ({ w: img.width, h: img.height })),
       barcodes: [],
     };
 
@@ -367,6 +369,9 @@
         evidence.barcodes.push({ format: "OCR (printed digits)", value: ocrDigits });
       }
 
+      // Pixel dimensions of what Gemini saw, persisted with the extraction so the
+      // letter-height ratio can be re-evaluated later (e.g. from history).
+      j.extraction.image_dims = evidence.dims;
       const results = window.LMPCRules.runRulesEngine(j.extraction);
       results.push(await buildBarcodeCard(evidence.barcodes, j.extraction));
       const verdict = window.LMPCRules.computeVerdict(results);
@@ -590,6 +595,35 @@
         </div>`;
     }
 
+    // Rule 7 letter-height: measured ratios / exact mm, plus the panel-size entry
+    // that turns the band verdict into an exact one (no calibration object needed).
+    let heightBoxHtml = "";
+    if (r.id === "font-size" && r.measure) {
+      const m = r.measure;
+      const rows = m.measured.map((x) => {
+        const val = x.hMm != null
+          ? `${x.hMm.toFixed(1)} mm <em class="muted">/ ${x.needMm.toFixed(1)} min</em>`
+          : `${(x.ratio * 100).toFixed(2)}% <em class="muted">of √panel</em>`;
+        const cls = x.ok === true ? "rm-ok" : x.ok === false ? "rm-bad" : "";
+        return `<div class="rm-item"><small>${esc(x.label)}</small><span class="${cls}">${val}</span></div>`;
+      }).join("");
+      const basis = m.areaCm2
+        ? `${m.panelCm.w} × ${m.panelCm.h} cm → ${Math.round(m.areaCm2)} cm² · Table-I row ${m.row}`
+        : `${Math.round(m.areaRange[0])}–${Math.round(m.areaRange[1])} cm² plausible for this pack`;
+      const isCyl = m.shape === "cylinder";
+      heightBoxHtml = `
+        <div class="rule-math-box">${rows}<div class="rm-item"><small>${m.areaCm2 ? "Panel (measured)" : "Panel area"}</small><span>${esc(basis)}</span></div></div>
+        ${interactive ? `
+        <div class="resolve-row panel-dims">
+          <span class="resolve-label">${isCyl ? "PANEL HEIGHT × CIRCUMFERENCE (CM)" : "PANEL WIDTH × HEIGHT (CM)"}</span>
+          <input class="metro-input dims-input" data-dim="w" type="number" min="0.1" step="0.1" inputmode="decimal" placeholder="${isCyl ? "height" : "width"}" value="${m.panelCm?.w ?? ""}" />
+          <span class="muted">×</span>
+          <input class="metro-input dims-input" data-dim="h" type="number" min="0.1" step="0.1" inputmode="decimal" placeholder="${isCyl ? "circumference" : "height"}" value="${m.panelCm?.h ?? ""}" />
+          <button type="button" class="btn dims-apply">MEASURE</button>
+          ${m.panelCm ? `<button type="button" class="btn resolve-undo dims-clear">CLEAR</button>` : ""}
+        </div>` : ""}`;
+    }
+
     return `
       <article class="rule-card s-${eff}${sevClass}" data-check="${esc(r.id)}" data-img="${r.image_index ?? 0}">
         <div class="rule-head">
@@ -603,7 +637,7 @@
           <span class="x-label">AI EXTRACTED (VERBATIM)</span>
           <span class="x-text ${r.extracted ? "" : "none"}">${r.extracted ? esc(r.extracted) : "— not found on label —"}</span>
         </div>
-        ${mathBoxHtml}
+        ${mathBoxHtml}${heightBoxHtml}
         <ul class="rule-findings">
           ${r.findings.map((f) => `<li>${esc(f)}</li>`).join("")}
         </ul>
@@ -942,6 +976,28 @@
       `<p class="metro-label">product identity</p><h2 class="pane-title">barcode match</h2>` +
       buildRuleCardHtml(card, false);
   }
+
+  // Panel-size entry on the letter-height card: re-evaluates Rule 7 exactly.
+  $("#results-content").addEventListener("click", (e) => {
+    const apply = e.target.closest(".dims-apply");
+    const clear = e.target.closest(".dims-clear");
+    if ((!apply && !clear) || !state.current) return;
+    let panelCm = null;
+    if (apply) {
+      const row = apply.closest(".panel-dims");
+      const w = parseFloat(row.querySelector('[data-dim="w"]').value);
+      const h = parseFloat(row.querySelector('[data-dim="h"]').value);
+      if (!(w > 0 && h > 0)) { showNotice("panel size", "Enter both panel dimensions in centimetres."); return; }
+      panelCm = { w, h };
+    }
+    const rec = state.current;
+    const idx = rec.results.findIndex((r) => r.id === "font-size");
+    const card = window.LMPCRules.assessLetterHeight(rec.extraction, panelCm);
+    if (idx >= 0) rec.results[idx] = card; else rec.results.push(card);
+    rec.verdict = window.LMPCRules.computeVerdict(rec.results);
+    if (rec.saved) updateStoredScan(rec);
+    renderResults();
+  });
 
   function bindToolbar() {
     $("#retry-btn")?.addEventListener("click", () => startScan(true));

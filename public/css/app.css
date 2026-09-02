@@ -722,6 +722,21 @@ textarea.metro-input { resize: vertical; }
 .rm-item .rm-val {
   color: var(--saffron);
 }
+.rm-item .rm-ok { color: var(--green); }
+.rm-item .rm-bad { color: var(--crimson); }
+.rm-item em { font-style: normal; font-weight: 500; font-size: 11px; }
+
+/* panel-size entry on the letter-height card */
+.panel-dims .dims-input { width: 96px; padding: 7px 10px; font-size: 12.5px; font-family: var(--font-mono); }
+.dims-apply {
+  padding: 7px 12px;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  background: transparent;
+  border: 1px solid rgba(255, 111, 31, 0.55);
+  color: var(--saffron);
+}
+.dims-apply:hover:not(:disabled) { background: rgba(255, 111, 31, 0.1); }
 
 .rule-findings { margin-top: 11px; list-style: none; }
 .rule-findings li {
