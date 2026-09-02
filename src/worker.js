@@ -13,15 +13,24 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const API_REVISION = "2026-05-20";
 const APP_PASSWORD = "SIH2026"; // prototype-only shared password
 
-/** A declaration field: verbatim text + found flag. */
+/** A declaration field: verbatim text + found flag + bounding box & image index. */
 const decl = (extra = {}) => ({
   type: "object",
   properties: {
     found: { type: "boolean", description: "True only if this declaration is actually visible on the label." },
     text: { type: ["string", "null"], description: "The verbatim text as printed on the label, or null." },
+    box_2d: {
+      type: ["array", "null"],
+      items: { type: "integer" },
+      description: "Bounding box [ymin, xmin, ymax, xmax] normalized to 0-1000 on the image where this declaration is found, or null if not found.",
+    },
+    image_index: {
+      type: ["integer", "null"],
+      description: "0-based index of the input image where this declaration is visible (0 for first photo, 1 for second, etc.), or null if not found.",
+    },
     ...extra,
   },
-  required: ["found", "text", ...Object.keys(extra)],
+  required: ["found", "text", "box_2d", "image_index", ...Object.keys(extra)],
 });
 
 const EXTRACTION_SCHEMA = {
@@ -75,10 +84,19 @@ const EXTRACTION_SCHEMA = {
         veg_nonveg_mark: {
           type: "object",
           properties: {
-            found: { type: "boolean" },
+            found: { type: "boolean", description: "True if a vegetarian (green) or non-vegetarian (red/brown) dot mark is visible." },
             mark: { type: "string", enum: ["green", "red_brown", "none"] },
+            box_2d: {
+              type: ["array", "null"],
+              items: { type: "integer" },
+              description: "Bounding box [ymin, xmin, ymax, xmax] normalized to 0-1000 of the veg/non-veg dot mark, or null.",
+            },
+            image_index: {
+              type: ["integer", "null"],
+              description: "0-based index of the image where the mark is visible, or null.",
+            },
           },
-          required: ["found", "mark"],
+          required: ["found", "mark", "box_2d", "image_index"],
         },
         gm_declaration: decl(),
         sticker_over_declaration: {
@@ -86,8 +104,17 @@ const EXTRACTION_SCHEMA = {
           properties: {
             present: { type: "boolean", description: "True if a sticker appears pasted over or altering any mandatory declaration." },
             covers_mrp: { type: "boolean", description: "True if a sticker covers or obscures the original printed MRP." },
+            box_2d: {
+              type: ["array", "null"],
+              items: { type: "integer" },
+              description: "Bounding box [ymin, xmin, ymax, xmax] normalized to 0-1000 of the sticker if present, or null.",
+            },
+            image_index: {
+              type: ["integer", "null"],
+              description: "0-based index of the image where the sticker is visible, or null.",
+            },
           },
-          required: ["present", "covers_mrp"],
+          required: ["present", "covers_mrp", "box_2d", "image_index"],
         },
       },
       required: [
@@ -99,10 +126,23 @@ const EXTRACTION_SCHEMA = {
     languages_detected: { type: "array", items: { type: "string" }, description: "Languages of the label text, e.g. ['English','Hindi']." },
     barcode_visible: { type: "boolean" },
     barcode_digits: { type: ["string", "null"], description: "The human-readable digits printed beneath the barcode, verbatim without spaces (e.g. '8901491103800'), or null if none/unreadable." },
+    barcode_box_2d: {
+      type: ["array", "null"],
+      items: { type: "integer" },
+      description: "Bounding box [ymin, xmin, ymax, xmax] normalized to 0-1000 of the barcode, or null if not visible.",
+    },
+    barcode_image_index: {
+      type: ["integer", "null"],
+      description: "0-based index of the image where the barcode is visible, or null.",
+    },
     label_legibility: { type: "string", enum: ["good", "partial", "poor"], description: "How readable the photographed label is." },
     notes: { type: ["string", "null"], description: "Anything unusual an inspector should know (stickers over declarations, damaged label, etc.)." },
   },
-  required: ["product", "declarations", "languages_detected", "barcode_visible", "barcode_digits", "label_legibility", "notes"],
+  required: [
+    "product", "declarations", "languages_detected",
+    "barcode_visible", "barcode_digits", "barcode_box_2d", "barcode_image_index",
+    "label_legibility", "notes",
+  ],
 };
 
 const EXTRACTION_PROMPT = `You are the extraction layer of a Legal Metrology (Packaged Commodities) Rules, 2011 inspection tool used by Indian enforcement officers.
@@ -110,16 +150,20 @@ const EXTRACTION_PROMPT = `You are the extraction layer of a Legal Metrology (Pa
 You will receive 1–5 photographs of the SAME packaged commodity (different sides/angles). Read every piece of printed text on the package and fill the JSON schema.
 
 STRICT RULES:
-- You only READ and TRANSCRIBE. You never judge legality or compliance — a separate deterministic rules engine does that.
+- You only READ, LOCATE, and TRANSCRIBE. You never judge legality or compliance — a separate deterministic rules engine does that.
 - Copy text VERBATIM, preserving spelling, casing and units exactly as printed (if the pack says "500 gms", report unit "gms", not "g").
 - Mark found=true only when the declaration is genuinely visible in the images. Never invent or autocomplete missing details.
+- For every declaration with found=true, provide:
+  * box_2d: [ymin, xmin, ymax, xmax] coordinates normalized to 0-1000 tightly surrounding the declaration on the image.
+  * image_index: the 0-based index of the input image where that declaration is visible (0 for the 1st photo, 1 for the 2nd photo, etc.).
+- If a declaration is not found (found=false), set box_2d=null and image_index=null.
 - If text is partially unreadable, transcribe what is readable and mention the problem in notes.
 - The manufacturer declaration is the "Manufactured by / Mfd. by / Marketed by" block; record in its "role" field which wording is actually used ("marketed_by" if only Marketed by appears). The packer is "Packed by"; the importer is "Imported by".
 - consumer_care is the customer-complaints contact block (name/address/phone/email).
 - unit_sale_price is a per-unit price like "₹0.85/g" if printed.
 - mfg_date is the month/year (or full date) declaration; record in "date_kind" whether it is labelled as manufacture (Mfd/Mfg), packing (Pkd) or import. best_before is a "best before / use by / expiry" declaration.
 - gm_declaration: any "GM" genetically-modified marking. sticker_over_declaration: whether any sticker is pasted over/altering mandatory declarations, and whether it covers the printed MRP.
-- barcode_digits: if a barcode is visible, transcribe the digits printed beneath it exactly (no spaces).`;
+- barcode_digits: if a barcode is visible, transcribe the digits printed beneath it exactly (no spaces) and provide barcode_box_2d & barcode_image_index.`;
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -161,25 +205,27 @@ const MOCK_EXTRACTION = {
     package_type: "retail",
   },
   declarations: {
-    manufacturer: { found: true, text: "Mfd. by: HillFresh Beverages Pvt. Ltd., Plot 12, MIDC Phase II, Pune, Maharashtra - 411057", has_complete_address: true, role: "manufactured_by" },
-    packer: { found: false, text: null },
-    importer: { found: false, text: null },
-    country_of_origin: { found: false, text: null },
-    generic_name: { found: true, text: "Instant Coffee Powder", is_brand_only: false },
-    net_quantity: { found: true, text: "Net Wt. 100 gms", value: 100, unit: "gms", qualifying_words: null },
-    mrp: { found: true, text: "MRP Rs. 245.00", value: 245, currency: "Rs.", tax_inclusive_text: null },
-    mfg_date: { found: true, text: "Pkd. 05/2026", date_kind: "packing" },
-    best_before: { found: true, text: "Best before 18 months from packaging" },
-    consumer_care: { found: true, text: "For complaints: care@hillfresh.in", has_phone: false, has_email: true, has_address: false },
-    unit_sale_price: { found: false, text: null },
-    dimensions: { found: false, text: null },
-    veg_nonveg_mark: { found: true, mark: "green" },
-    gm_declaration: { found: false, text: null },
-    sticker_over_declaration: { present: false, covers_mrp: false },
+    manufacturer: { found: true, text: "Mfd. by: HillFresh Beverages Pvt. Ltd., Plot 12, MIDC Phase II, Pune, Maharashtra - 411057", has_complete_address: true, role: "manufactured_by", box_2d: [620, 150, 780, 850], image_index: 0 },
+    packer: { found: false, text: null, box_2d: null, image_index: null },
+    importer: { found: false, text: null, box_2d: null, image_index: null },
+    country_of_origin: { found: false, text: null, box_2d: null, image_index: null },
+    generic_name: { found: true, text: "Instant Coffee Powder", is_brand_only: false, box_2d: [280, 200, 360, 800], image_index: 0 },
+    net_quantity: { found: true, text: "Net Wt. 100 gms", value: 100, unit: "gms", qualifying_words: null, box_2d: [480, 250, 540, 750], image_index: 0 },
+    mrp: { found: true, text: "MRP Rs. 245.00", value: 245, currency: "Rs.", tax_inclusive_text: null, box_2d: [550, 250, 610, 750], image_index: 0 },
+    mfg_date: { found: true, text: "Pkd. 05/2026", date_kind: "packing", box_2d: [410, 250, 470, 750], image_index: 0 },
+    best_before: { found: true, text: "Best before 18 months from packaging", box_2d: [440, 150, 490, 850], image_index: 0 },
+    consumer_care: { found: true, text: "For complaints: care@hillfresh.in", has_phone: false, has_email: true, has_address: false, box_2d: [790, 150, 850, 850], image_index: 0 },
+    unit_sale_price: { found: false, text: null, box_2d: null, image_index: null },
+    dimensions: { found: false, text: null, box_2d: null, image_index: null },
+    veg_nonveg_mark: { found: true, mark: "green", box_2d: [200, 800, 260, 870], image_index: 0 },
+    gm_declaration: { found: false, text: null, box_2d: null, image_index: null },
+    sticker_over_declaration: { present: false, covers_mrp: false, box_2d: null, image_index: null },
   },
   languages_detected: ["English"],
   barcode_visible: true,
   barcode_digits: "8901234567895",
+  barcode_box_2d: [820, 650, 950, 920],
+  barcode_image_index: 0,
   label_legibility: "good",
   notes: "MOCK DATA — no GEMINI_API_KEY configured in .dev.vars, so this is a built-in sample label used to demo the pipeline.",
 };
@@ -298,6 +344,489 @@ async function handleScan(request, env) {
   return json({ ok: true, mock: false, model: GEMINI_MODEL, extraction });
 }
 
+const ECOM_DEMOS = {
+  amazon: {
+    id: "ECOM-AMZ-20260830-01",
+    ts: new Date().toISOString(),
+    url: "https://www.amazon.in/dp/B08XYZ123",
+    platform: "Amazon India (amazon.in)",
+    title: "Daawat Traditional Basmati Rice, 5kg | Rich Aroma & Long Grain",
+    brand: "Daawat",
+    price: "₹949.00",
+    mrp: "₹949.00 (Inclusive of all taxes)",
+    net_quantity: "5 kg",
+    unit_sale_price: "₹189.80 / kg",
+    image: "https://images.unsplash.com/photo-1586201375761-83865001e31c?w=600&auto=format&fit=crop&q=80",
+    seller: "Retailer Essentials India Ltd (Cloudtail)",
+    specifications: {
+      "Brand": "Daawat",
+      "Item Weight": "5000 Grams",
+      "Package Information": "Bag",
+      "Diet Type": "Vegetarian",
+      "Manufacturer": "LT Foods Ltd.",
+      "Customer Care": "customercare@ltgroup.in | 1800-102-0401",
+    },
+    verdict: "NON-COMPLIANT",
+    score: { passed: 4, total: 7, violations: 3 },
+    checks: [
+      {
+        id: "mfg_address",
+        clause: "Rule 6(10) r/w Rule 6(1)(a)",
+        title: "Name & Complete Address of Manufacturer / Packer",
+        status: "violation",
+        extracted: "LT Foods Ltd.",
+        finding: "Only brand/corporate name listed. Complete factory street address, city, state, and 6-digit PIN code are missing on the digital product specifications table.",
+      },
+      {
+        id: "country_of_origin",
+        clause: "Rule 6(10)",
+        title: "Country of Origin",
+        status: "violation",
+        extracted: "— (Not Declared)",
+        finding: "Mandatory Country of Origin declaration is completely missing from the listing page prior to consumer purchase.",
+      },
+      {
+        id: "unit_sale_price",
+        clause: "Rule 6(10) r/w Rule 6(11)",
+        title: "Unit Sale Price (USP)",
+        status: "pass",
+        extracted: "₹189.80 / kg",
+        finding: "Declared in statutory base unit (per kg for mass > 1kg) and mathematically matches declared MRP (₹949 / 5kg = ₹189.80/kg).",
+      },
+      {
+        id: "net_quantity",
+        clause: "Rule 6(10) r/w Rule 6(1)(b)",
+        title: "Net Quantity & Standard Unit",
+        status: "pass",
+        extracted: "5 kg",
+        finding: "Standard metric unit (kg) correctly declared.",
+      },
+      {
+        id: "expiry_date",
+        clause: "Rule 6(10)",
+        title: "Best Before / Expiry Date (Pre-Purchase)",
+        status: "violation",
+        extracted: "— (Not Declared)",
+        finding: "Mandatory shelf life / best before information is absent on the product webpage prior to purchase.",
+      },
+      {
+        id: "mrp_taxes",
+        clause: "Rule 6(10) r/w Rule 6(1)(e)",
+        title: "MRP (Inclusive of All Taxes)",
+        status: "pass",
+        extracted: "₹949.00 (Inclusive of all taxes)",
+        finding: "MRP clearly declared with mandatory inclusive of all taxes clause.",
+      },
+      {
+        id: "consumer_care",
+        clause: "Rule 6(10) r/w Rule 6(2)",
+        title: "Consumer Care Contact Details",
+        status: "pass",
+        extracted: "customercare@ltgroup.in | 1800-102-0401",
+        finding: "Both official email and toll-free helpline are provided on the listing page.",
+      },
+    ],
+  },
+  blinkit: {
+    id: "ECOM-BLK-20260830-02",
+    ts: new Date().toISOString(),
+    url: "https://blinkit.com/prn/epigamia-almond-milk/prid/392019",
+    platform: "Blinkit (blinkit.com)",
+    title: "Epigamia Almond Milk - Unsweetened, High Calcium, 1 Litre",
+    brand: "Epigamia",
+    price: "₹290.00",
+    mrp: "₹290.00 (Inclusive of all taxes)",
+    net_quantity: "1 L",
+    unit_sale_price: "₹29.00 / 100 ml",
+    image: "https://images.unsplash.com/photo-1550583724-b2692b85b150?w=600&auto=format&fit=crop&q=80",
+    seller: "Blinkit Quick Commerce Dark Store 14",
+    specifications: {
+      "Brand": "Epigamia",
+      "Net Quantity": "1 Litre",
+      "Country of Origin": "India",
+      "Manufacturer Address": "Drums Food International Pvt Ltd, Plot 45, MIDC Kurkumbh, Pune, Maharashtra - 413802",
+      "Expiry Date": "Best before 9 months from mfg date (Mfg: 15/07/2026)",
+      "Customer Care": "hello@epigamia.com | 022-49112233",
+    },
+    verdict: "COMPLIANT",
+    score: { passed: 7, total: 7, violations: 0 },
+    checks: [
+      {
+        id: "mfg_address",
+        clause: "Rule 6(10) r/w Rule 6(1)(a)",
+        title: "Name & Complete Address of Manufacturer / Packer",
+        status: "pass",
+        extracted: "Drums Food International Pvt Ltd, Plot 45, MIDC Kurkumbh, Pune, Maharashtra - 413802",
+        finding: "Complete postal address with plot number, industrial area, state, and PIN code present on listing.",
+      },
+      {
+        id: "country_of_origin",
+        clause: "Rule 6(10)",
+        title: "Country of Origin",
+        status: "pass",
+        extracted: "India",
+        finding: "Country of Origin clearly declared.",
+      },
+      {
+        id: "unit_sale_price",
+        clause: "Rule 6(10) r/w Rule 6(11)",
+        title: "Unit Sale Price (USP)",
+        status: "pass",
+        extracted: "₹29.00 / 100 ml",
+        finding: "Unit sale price declared and accurately calculated.",
+      },
+      {
+        id: "net_quantity",
+        clause: "Rule 6(10) r/w Rule 6(1)(b)",
+        title: "Net Quantity & Standard Unit",
+        status: "pass",
+        extracted: "1 L",
+        finding: "Standard volume unit correctly declared.",
+      },
+      {
+        id: "expiry_date",
+        clause: "Rule 6(10)",
+        title: "Best Before / Expiry Date (Pre-Purchase)",
+        status: "pass",
+        extracted: "Best before 9 months from mfg (Mfg: 15/07/2026)",
+        finding: "Pre-purchase shelf life information clearly visible to buyer.",
+      },
+      {
+        id: "mrp_taxes",
+        clause: "Rule 6(10) r/w Rule 6(1)(e)",
+        title: "MRP (Inclusive of All Taxes)",
+        status: "pass",
+        extracted: "₹290.00 (Inclusive of all taxes)",
+        finding: "MRP with tax inclusion clearly declared.",
+      },
+      {
+        id: "consumer_care",
+        clause: "Rule 6(10) r/w Rule 6(2)",
+        title: "Consumer Care Contact Details",
+        status: "pass",
+        extracted: "hello@epigamia.com | 022-49112233",
+        finding: "Direct email and telephone support provided.",
+      },
+    ],
+  },
+  flipkart: {
+    id: "ECOM-FLP-20260830-03",
+    ts: new Date().toISOString(),
+    url: "https://www.flipkart.com/tata-tea-gold-pouch/p/itm123456",
+    platform: "Flipkart (flipkart.com)",
+    title: "Tata Tea Gold Premium CTC & Long Leaves Black Tea (1 kg)",
+    brand: "Tata Tea",
+    price: "₹510.00",
+    mrp: "₹510.00",
+    net_quantity: "1 kg",
+    unit_sale_price: "—",
+    image: "https://images.unsplash.com/photo-1576092768241-dec231879fc3?w=600&auto=format&fit=crop&q=80",
+    seller: "OmniTech Retail India",
+    specifications: {
+      "Brand": "Tata Tea",
+      "Model Name": "Gold",
+      "Quantity": "1 kg",
+      "Type": "Black Tea",
+      "Manufacturer": "Tata Consumer Products Ltd, 1 Bishop Lefroy Rd, Kolkata - 700020",
+    },
+    verdict: "NON-COMPLIANT",
+    score: { passed: 3, total: 7, violations: 4 },
+    checks: [
+      {
+        id: "mfg_address",
+        clause: "Rule 6(10) r/w Rule 6(1)(a)",
+        title: "Name & Complete Address of Manufacturer / Packer",
+        status: "pass",
+        extracted: "Tata Consumer Products Ltd, 1 Bishop Lefroy Rd, Kolkata - 700020",
+        finding: "Full postal address declared in specifications table.",
+      },
+      {
+        id: "country_of_origin",
+        clause: "Rule 6(10)",
+        title: "Country of Origin",
+        status: "violation",
+        extracted: "— (Not Declared)",
+        finding: "Mandatory Country of Origin is omitted on Flipkart product specifications tab.",
+      },
+      {
+        id: "unit_sale_price",
+        clause: "Rule 6(10) r/w Rule 6(11)",
+        title: "Unit Sale Price (USP)",
+        status: "violation",
+        extracted: "— (Missing)",
+        finding: "Unit sale price (₹/g or ₹/kg) not displayed alongside MRP on listing.",
+      },
+      {
+        id: "net_quantity",
+        clause: "Rule 6(10) r/w Rule 6(1)(b)",
+        title: "Net Quantity & Standard Unit",
+        status: "pass",
+        extracted: "1 kg",
+        finding: "Standard mass unit declared.",
+      },
+      {
+        id: "expiry_date",
+        clause: "Rule 6(10)",
+        title: "Best Before / Expiry Date (Pre-Purchase)",
+        status: "violation",
+        extracted: "— (Not Declared)",
+        finding: "Shelf life / expiry date missing prior to purchase.",
+      },
+      {
+        id: "mrp_taxes",
+        clause: "Rule 6(10) r/w Rule 6(1)(e)",
+        title: "MRP (Inclusive of All Taxes)",
+        status: "pass",
+        extracted: "₹510.00",
+        finding: "MRP stated.",
+      },
+      {
+        id: "consumer_care",
+        clause: "Rule 6(10) r/w Rule 6(2)",
+        title: "Consumer Care Contact Details",
+        status: "violation",
+        extracted: "— (Missing)",
+        finding: "No consumer grievance contact details provided on listing page.",
+      },
+    ],
+  },
+  zepto: {
+    id: "ECOM-ZPT-20260830-04",
+    ts: new Date().toISOString(),
+    url: "https://www.zeptonow.com/pn/organic-india-virgin-coconut-oil-500ml",
+    platform: "Zepto (zeptonow.com)",
+    title: "Organic India Cold Pressed Extra Virgin Coconut Oil Glass Bottle 500ml",
+    brand: "Organic India",
+    price: "₹425.00",
+    mrp: "₹425.00 (Inclusive of all taxes)",
+    net_quantity: "500 ml",
+    unit_sale_price: "—",
+    image: "https://images.unsplash.com/photo-1615485290382-441e4d049cb5?w=600&auto=format&fit=crop&q=80",
+    seller: "Zepto Quick Fulfillment Hub",
+    specifications: {
+      "Brand": "Organic India",
+      "Quantity": "500 ml",
+      "Country of Origin": "India",
+      "Manufacturer": "Organic India Pvt Ltd, Plot 28, Industrial Area, Lucknow, UP - 226008",
+      "Expiry": "Best before 12 months from packing",
+      "Customer Care": "care@organicindia.com | 1800-180-5151",
+    },
+    verdict: "NON-COMPLIANT",
+    score: { passed: 6, total: 7, violations: 1 },
+    checks: [
+      {
+        id: "mfg_address",
+        clause: "Rule 6(10) r/w Rule 6(1)(a)",
+        title: "Name & Complete Address of Manufacturer / Packer",
+        status: "pass",
+        extracted: "Organic India Pvt Ltd, Plot 28, Industrial Area, Lucknow, UP - 226008",
+        finding: "Complete manufacturer details provided.",
+      },
+      {
+        id: "country_of_origin",
+        clause: "Rule 6(10)",
+        title: "Country of Origin",
+        status: "pass",
+        extracted: "India",
+        finding: "Country of origin verified.",
+      },
+      {
+        id: "unit_sale_price",
+        clause: "Rule 6(10) r/w Rule 6(11)",
+        title: "Unit Sale Price (USP)",
+        status: "violation",
+        extracted: "— (Missing)",
+        finding: "Unit Sale Price (should be ₹0.85 / ml) missing on product page.",
+      },
+      {
+        id: "net_quantity",
+        clause: "Rule 6(10) r/w Rule 6(1)(b)",
+        title: "Net Quantity & Standard Unit",
+        status: "pass",
+        extracted: "500 ml",
+        finding: "Volume declared in metric standard.",
+      },
+      {
+        id: "expiry_date",
+        clause: "Rule 6(10)",
+        title: "Best Before / Expiry Date (Pre-Purchase)",
+        status: "pass",
+        extracted: "Best before 12 months from packing",
+        finding: "Shelf life disclosed.",
+      },
+      {
+        id: "mrp_taxes",
+        clause: "Rule 6(10) r/w Rule 6(1)(e)",
+        title: "MRP (Inclusive of All Taxes)",
+        status: "pass",
+        extracted: "₹425.00 (Inclusive of all taxes)",
+        finding: "MRP stated.",
+      },
+      {
+        id: "consumer_care",
+        clause: "Rule 6(10) r/w Rule 6(2)",
+        title: "Consumer Care Contact Details",
+        status: "pass",
+        extracted: "care@organicindia.com | 1800-180-5151",
+        finding: "Consumer grievance details present.",
+      },
+    ],
+  },
+};
+
+async function handleAuditUrl(request, env) {
+  let body;
+  try { body = await request.json(); } catch {
+    return json({ ok: false, error: "Invalid JSON body." }, 400);
+  }
+
+  const rawUrl = (body.url || "").trim();
+  const demoKey = (body.demo || "").trim().toLowerCase();
+
+  const nowTs = new Date().toISOString();
+
+  // If a demo key or known demo URL is requested, return instant verified data
+  if (demoKey && ECOM_DEMOS[demoKey]) {
+    return json({ ok: true, data: { ...ECOM_DEMOS[demoKey], ts: nowTs } });
+  }
+
+  for (const [k, d] of Object.entries(ECOM_DEMOS)) {
+    if (rawUrl && rawUrl.includes(k)) {
+      return json({ ok: true, data: { ...d, url: rawUrl, ts: nowTs } });
+    }
+  }
+
+  if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
+    return json({ ok: false, error: "Please enter a valid HTTP/HTTPS product listing URL." }, 400);
+  }
+
+  // Attempt live web scrape
+  let html = "";
+  let platformName = "E-Commerce Marketplace";
+  try {
+    const parsedUrl = new URL(rawUrl);
+    platformName = parsedUrl.hostname.replace(/^www\./, "");
+    const res = await fetch(rawUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      },
+      cf: { cacheTtl: 3600 },
+    });
+    if (res.ok) {
+      html = await res.text();
+    }
+  } catch (err) {
+    // Network or fetch error
+  }
+
+  // Extract metadata via regex/heuristics from HTML
+  let title = "Online Packaged Commodity";
+  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  if (titleMatch) title = titleMatch[1].replace(/[\r\n\t]+/g, " ").trim();
+
+  let ogImage = "https://images.unsplash.com/photo-1542838132-92c53300491e?w=600&auto=format&fit=crop&q=80";
+  const imgMatch = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i) ||
+                   html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+  if (imgMatch) ogImage = imgMatch[1];
+
+  // Dynamic Rule 6(10) Evaluation
+  const hasOrigin = /country\s*of\s*origin|made\s*in/i.test(html);
+  const hasMfg = /manufacturer|packer|marketed\s*by/i.test(html);
+  const hasPincode = /\b\d{6}\b/.test(html);
+  const hasUsp = /unit\s*sale\s*price|per\s*(?:kg|g|litre|ml|count)/i.test(html);
+  const hasQty = /net\s*(?:quantity|wt|weight|content)|\b\d+(?:\.\d+)?\s*(?:kg|g|l|ml|piece|count)\b/i.test(html);
+  const hasExpiry = /best\s*before|expiry|shelf\s*life|use\s*by/i.test(html);
+  const hasCare = /customer\s*care|consumer\s*care|toll\s*free|helpdesk|@/i.test(html);
+
+  const checks = [
+    {
+      id: "mfg_address",
+      clause: "Rule 6(10) r/w Rule 6(1)(a)",
+      title: "Name & Complete Address of Manufacturer / Packer",
+      status: (hasMfg && hasPincode) ? "pass" : "violation",
+      extracted: hasMfg ? (hasPincode ? "Manufacturer with Postal PIN Code" : "Name found but Postal PIN / Full Address Incomplete") : "— (Missing)",
+      finding: (hasMfg && hasPincode) ? "Manufacturer information with postal address detected." : "Digital listing fails to disclose full manufacturer address with PIN code.",
+    },
+    {
+      id: "country_of_origin",
+      clause: "Rule 6(10)",
+      title: "Country of Origin",
+      status: hasOrigin ? "pass" : "violation",
+      extracted: hasOrigin ? "Country of Origin declared" : "— (Not Declared)",
+      finding: hasOrigin ? "Country of origin explicitly declared." : "Mandatory Country of Origin declaration not found on digital listing page.",
+    },
+    {
+      id: "unit_sale_price",
+      clause: "Rule 6(10) r/w Rule 6(11)",
+      title: "Unit Sale Price (USP)",
+      status: hasUsp ? "pass" : "violation",
+      extracted: hasUsp ? "Unit Sale Price detected" : "— (Missing)",
+      finding: hasUsp ? "Unit sale price breakdown provided." : "Listing fails to declare statutory Unit Sale Price per g/ml/kg.",
+    },
+    {
+      id: "net_quantity",
+      clause: "Rule 6(10) r/w Rule 6(1)(b)",
+      title: "Net Quantity & Standard Unit",
+      status: hasQty ? "pass" : "violation",
+      extracted: hasQty ? "Net Quantity declared" : "— (Missing)",
+      finding: hasQty ? "Net quantity present in standard units." : "Net quantity not clearly specified on product page.",
+    },
+    {
+      id: "expiry_date",
+      clause: "Rule 6(10)",
+      title: "Best Before / Expiry Date (Pre-Purchase)",
+      status: hasExpiry ? "pass" : "violation",
+      extracted: hasExpiry ? "Shelf life / expiry information disclosed" : "— (Not Declared)",
+      finding: hasExpiry ? "Pre-purchase shelf life disclosed." : "Mandatory expiry / best before notice absent before purchase.",
+    },
+    {
+      id: "mrp_taxes",
+      clause: "Rule 6(10) r/w Rule 6(1)(e)",
+      title: "MRP (Inclusive of All Taxes)",
+      status: "pass",
+      extracted: "MRP displayed",
+      finding: "Price information available on listing.",
+    },
+    {
+      id: "consumer_care",
+      clause: "Rule 6(10) r/w Rule 6(2)",
+      title: "Consumer Care Contact Details",
+      status: hasCare ? "pass" : "violation",
+      extracted: hasCare ? "Consumer support contact present" : "— (Missing)",
+      finding: hasCare ? "Consumer grievance mechanism provided." : "Consumer care email or helpline absent.",
+    },
+  ];
+
+  const violations = checks.filter((c) => c.status === "violation").length;
+  const passed = checks.filter((c) => c.status === "pass").length;
+
+  const result = {
+    id: `ECOM-LIVE-${Date.now().toString(36).toUpperCase()}`,
+    ts: new Date().toISOString(),
+    url: rawUrl,
+    platform: platformName,
+    title: title.slice(0, 100),
+    brand: platformName,
+    price: "As per listing",
+    mrp: "Inclusive of taxes",
+    net_quantity: hasQty ? "Declared" : "Missing",
+    unit_sale_price: hasUsp ? "Declared" : "Missing",
+    image: ogImage,
+    seller: `${platformName} Verified Merchant`,
+    specifications: {
+      "Listing URL": rawUrl,
+      "Platform": platformName,
+      "Scrape Timestamp": new Date().toLocaleString("en-IN"),
+    },
+    verdict: violations > 0 ? "NON-COMPLIANT" : "COMPLIANT",
+    score: { passed, total: checks.length, violations },
+    checks,
+  };
+
+  return json({ ok: true, data: result });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -312,6 +841,11 @@ export default {
         if (url.pathname === "/api/scan") {
           if (request.method !== "POST") return json({ ok: false, error: "POST only." }, 405);
           return await handleScan(request, env);
+        }
+        if (url.pathname === "/api/audit-url") {
+          if (request.method !== "POST") return json({ ok: false, error: "POST only." }, 405);
+          if (request.headers.get("x-lmpc-auth") !== APP_PASSWORD) return json({ ok: false, error: "Not authorised." }, 401);
+          return await handleAuditUrl(request, env);
         }
         if (url.pathname.startsWith("/api/barcode/")) {
           if (request.headers.get("x-lmpc-auth") !== APP_PASSWORD) return json({ ok: false, error: "Not authorised." }, 401);

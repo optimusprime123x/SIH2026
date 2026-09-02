@@ -63,13 +63,15 @@ const MONTH_WORDS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "se
 
 const norm = (s) => (s ?? "").toString().trim().toLowerCase();
 
-function check(id, group, clause, title, requirement) {
+function check(id, group, clause, title, requirement, box_2d = null, image_index = null) {
   return {
     id, group, clause, title, requirement,
     extracted: null,       // verbatim label text shown to the inspector
     status: STATUS.REVIEW,
     severity: null,        // 'critical' | 'major' | 'minor'
     findings: [],          // human sentences describing what the rules matched
+    box_2d,
+    image_index,
   };
 }
 
@@ -102,6 +104,162 @@ function parseMonthYear(text) {
   return null;
 }
 
+/**
+ * Compute the legally expected statutory Unit Sale Price (USP) and base unit
+ * under Rule 6(11) of the Legal Metrology (Packaged Commodities) Rules, 2011.
+ */
+function computeExpectedUSP(mrp, netQty) {
+  if (!mrp || typeof mrp.value !== "number" || mrp.value <= 0) return null;
+  if (!netQty || typeof netQty.value !== "number" || netQty.value <= 0 || !netQty.unit) return null;
+
+  const price = mrp.value;
+  const qty = netQty.value;
+  const unitRaw = norm(netQty.unit).replace(/\.$/, "");
+  const canonicalUnit = NON_STANDARD_UNITS[unitRaw] || SPELLED_OUT_UNITS[unitRaw] || unitRaw;
+
+  // Mass / Weight
+  if (["g", "kg", "mg"].includes(canonicalUnit)) {
+    const totalGrams = canonicalUnit === "kg" ? qty * 1000 : canonicalUnit === "mg" ? qty / 1000 : qty;
+    if (totalGrams >= 1000) {
+      const kg = totalGrams / 1000;
+      const isExempt = totalGrams === 1000;
+      return {
+        category: "mass",
+        expectedBaseUnit: "kg",
+        expectedPrice: Math.round((price / kg) * 100) / 100,
+        rawPrice: price / kg,
+        isExempt,
+        formula: `₹${price.toFixed(2)} ÷ ${kg} kg`,
+      };
+    } else {
+      const isExempt = totalGrams === 1;
+      return {
+        category: "mass",
+        expectedBaseUnit: "g",
+        expectedPrice: Math.round((price / totalGrams) * 100) / 100,
+        rawPrice: price / totalGrams,
+        isExempt,
+        formula: `₹${price.toFixed(2)} ÷ ${totalGrams} g`,
+      };
+    }
+  }
+
+  // Volume / Liquid
+  if (["ml", "l", "cl"].includes(canonicalUnit)) {
+    const totalMl = canonicalUnit === "l" ? qty * 1000 : canonicalUnit === "cl" ? qty * 10 : qty;
+    if (totalMl >= 1000) {
+      const litres = totalMl / 1000;
+      const isExempt = totalMl === 1000;
+      return {
+        category: "volume",
+        expectedBaseUnit: "l",
+        expectedPrice: Math.round((price / litres) * 100) / 100,
+        rawPrice: price / litres,
+        isExempt,
+        formula: `₹${price.toFixed(2)} ÷ ${litres} L`,
+      };
+    } else {
+      const isExempt = totalMl === 1;
+      return {
+        category: "volume",
+        expectedBaseUnit: "ml",
+        expectedPrice: Math.round((price / totalMl) * 100) / 100,
+        rawPrice: price / totalMl,
+        isExempt,
+        formula: `₹${price.toFixed(2)} ÷ ${totalMl} ml`,
+      };
+    }
+  }
+
+  // Dimensions / Length
+  if (["cm", "m", "mm"].includes(canonicalUnit)) {
+    const totalCm = canonicalUnit === "m" ? qty * 100 : canonicalUnit === "mm" ? qty / 10 : qty;
+    if (totalCm >= 100) {
+      const metres = totalCm / 100;
+      const isExempt = totalCm === 100;
+      return {
+        category: "length",
+        expectedBaseUnit: "m",
+        expectedPrice: Math.round((price / metres) * 100) / 100,
+        rawPrice: price / metres,
+        isExempt,
+        formula: `₹${price.toFixed(2)} ÷ ${metres} m`,
+      };
+    } else {
+      const isExempt = totalCm === 1;
+      return {
+        category: "length",
+        expectedBaseUnit: "cm",
+        expectedPrice: Math.round((price / totalCm) * 100) / 100,
+        rawPrice: price / totalCm,
+        isExempt,
+        formula: `₹${price.toFixed(2)} ÷ ${totalCm} cm`,
+      };
+    }
+  }
+
+  // Count / Numbers (units, pieces, N, U)
+  if (["n", "u", "pc", "pcs", "piece", "pieces", "pair", "pairs", "sheet", "sheets", "tablet", "tablets", "capsule", "capsules", "sachet", "sachets"].includes(canonicalUnit)) {
+    const isExempt = qty === 1;
+    return {
+      category: "count",
+      expectedBaseUnit: ["n", "u"].includes(canonicalUnit) ? canonicalUnit.toUpperCase() : "N",
+      expectedPrice: Math.round((price / qty) * 100) / 100,
+      rawPrice: price / qty,
+      isExempt,
+      formula: `₹${price.toFixed(2)} ÷ ${qty} N`,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Parse human-declared USP text from the label (e.g. "₹0.85/g", "Rs. 45 per 100g", "USP Rs 12.50/N").
+ */
+function parseDeclaredUSP(text) {
+  if (!text || typeof text !== "string") return null;
+  const t = norm(text).replace(/,/g, "");
+
+  // Check for non-standard multiplier base: "100g", "100 ml", "50g", "dozen", etc.
+  let multiplier = 1;
+  let isIllegalMultiplier = false;
+  const multiMatch = t.match(/(?:per|\/)\s*(\d+)\s*(g|gm|gms|gram|grams|kg|kgs|ml|mls|l|ltr|litre|cm|m|n|u|pc|piece|unit)\b/);
+  if (multiMatch && parseInt(multiMatch[1], 10) > 1) {
+    multiplier = parseInt(multiMatch[1], 10);
+    isIllegalMultiplier = true;
+  } else if (/\bdozen\b/.test(t)) {
+    multiplier = 12;
+    isIllegalMultiplier = true;
+  }
+
+  // Match price numeric digits: e.g. "0.85", "245.00"
+  let price = null;
+  const priceMatch = t.match(/(?:(?:usp|mrp|price|unit\s*sale\s*price|rate)\s*[:=-]?\s*)?(?:₹|rs\.?|inr|rupees)?\s*[:=-]?\s*(\d+(?:\.\d+)?)/);
+  if (priceMatch) {
+    price = parseFloat(priceMatch[1]);
+  } else {
+    const anyNum = t.match(/(\d+(?:\.\d+)?)/);
+    if (anyNum) price = parseFloat(anyNum[1]);
+  }
+
+  // Match declared unit
+  let declaredUnit = null;
+  const unitMatch = t.match(/(?:per|\/)\s*(?:\d+\s*)?(kg|kgs|kilogram|g|gm|gms|gram|grams|mg|ml|mls|millilitre|l|lt|ltr|litre|cm|m|meter|n|u|pc|pcs|piece|pieces|unit|units|pair|sheet|tablet|capsule|sachet)\b/);
+  if (unitMatch) {
+    const rawU = unitMatch[1];
+    declaredUnit = NON_STANDARD_UNITS[rawU] || SPELLED_OUT_UNITS[rawU] || rawU;
+  }
+
+  return {
+    raw: text,
+    price,
+    multiplier,
+    isIllegalMultiplier,
+    declaredUnit,
+  };
+}
+
 /** Main entry: extraction JSON -> array of check results. */
 function runRulesEngine(extraction) {
   const d = extraction?.declarations ?? {};
@@ -127,6 +285,8 @@ function runRulesEngine(extraction) {
     const c = check("manufacturer", G1, "Rule 6(1)(a), Rule 10", "Manufacturer / packer / importer",
       "Name and complete address of the manufacturer (and packer if different; importer for imports) must be declared.");
     const m = d.manufacturer ?? {};
+    c.box_2d = m.box_2d || d.packer?.box_2d || d.importer?.box_2d || null;
+    c.image_index = m.image_index ?? d.packer?.image_index ?? d.importer?.image_index ?? null;
     const parts = [m.found && m.text, d.packer?.found && `Packed by: ${d.packer.text}`, d.importer?.found && `Imported by: ${d.importer.text}`].filter(Boolean);
     c.extracted = parts.length ? parts.join("  •  ") : null;
     if (!m.found && !d.packer?.found && !d.importer?.found) {
@@ -156,6 +316,8 @@ function runRulesEngine(extraction) {
     const c = check("origin", G1, "Rule 6(1)(aa)", "Country of origin",
       "Imported packages must declare the country of origin, manufacture or assembly.");
     const o = d.country_of_origin ?? {};
+    c.box_2d = o.box_2d || null;
+    c.image_index = o.image_index ?? null;
     c.extracted = o.found ? o.text : null;
     if (!isImported) {
       c.status = o.found ? STATUS.PASS : STATUS.NA;
@@ -175,6 +337,8 @@ function runRulesEngine(extraction) {
     const c = check("generic-name", G1, "Rule 6(1)(b)", "Common or generic name",
       "The commodity must be identified by its common or generic name; a brand name alone is not sufficient.");
     const g = d.generic_name ?? {};
+    c.box_2d = g.box_2d || null;
+    c.image_index = g.image_index ?? null;
     c.extracted = g.found ? g.text : null;
     if (g.found && !g.is_brand_only) {
       c.status = STATUS.PASS;
@@ -194,6 +358,8 @@ function runRulesEngine(extraction) {
     const c = check("net-quantity", G2, "Rule 6(1)(c), Rules 11–13", "Net quantity declaration",
       "Net quantity (excluding packaging) must be declared in standard SI units, with no qualifying words.");
     const q = d.net_quantity ?? {};
+    c.box_2d = q.box_2d || null;
+    c.image_index = q.image_index ?? null;
     c.extracted = q.found ? q.text : null;
     if (!q.found) {
       c.status = STATUS.MISSING; c.severity = "critical";
@@ -267,6 +433,8 @@ function runRulesEngine(extraction) {
     const c = check("mfg-date", G1, "Rule 6(1)(d)", "Month & year of manufacture",
       "The month and year of manufacture must be declared (general rule after the 2021 amendment).");
     const m = d.mfg_date ?? {};
+    c.box_2d = m.box_2d || null;
+    c.image_index = m.image_index ?? null;
     c.extracted = m.found ? m.text : null;
     if (!m.found) {
       c.status = STATUS.MISSING; c.severity = "critical";
@@ -307,6 +475,8 @@ function runRulesEngine(extraction) {
     const c = check("best-before", G1, "Rule 6(1)(da)", "Best before / use by date",
       "Required where the commodity may become unfit for human consumption over time (food-type products).");
     const b = d.best_before ?? {};
+    c.box_2d = b.box_2d || null;
+    c.image_index = b.image_index ?? null;
     c.extracted = b.found ? b.text : null;
     if (b.found) {
       c.status = STATUS.PASS;
@@ -326,6 +496,8 @@ function runRulesEngine(extraction) {
     const c = check("mrp", G2, "Rule 6(1)(e)", "Maximum Retail Price",
       "MRP must be declared in Indian currency and clearly stated as inclusive of all taxes.");
     const m = d.mrp ?? {};
+    c.box_2d = m.box_2d || null;
+    c.image_index = m.image_index ?? null;
     c.extracted = m.found ? m.text : null;
     if (!m.found) {
       c.status = STATUS.MISSING; c.severity = "critical";
@@ -369,6 +541,8 @@ function runRulesEngine(extraction) {
     const c = check("consumer-care", G1, "Rule 6(2)", "Consumer care details",
       "Name, address, telephone number and e-mail of the consumer-complaints contact must be declared.");
     const cc = d.consumer_care ?? {};
+    c.box_2d = cc.box_2d || null;
+    c.image_index = cc.image_index ?? null;
     c.extracted = cc.found ? cc.text : null;
     if (!cc.found) {
       c.status = STATUS.MISSING; c.severity = "major";
@@ -391,16 +565,78 @@ function runRulesEngine(extraction) {
 
   // ---- Rule 6(11) — Unit sale price ------------------------------------------
   {
-    const c = check("unit-sale-price", G2, "Rule 6(11)", "Unit sale price",
-      "Price per g/kg/ml/l/cm/m or per unit, rounded to two decimals (with exceptions for multipacks and MRP = USP).");
+    const c = check("unit-sale-price", G2, "Rule 6(11)", "Unit sale price (USP)",
+      "Price per standard base unit (per g/kg/ml/l/cm/m/N) rounded to two decimals (mandatory for packages > 1g/ml/piece).");
     const u = d.unit_sale_price ?? {};
+    const mrp = d.mrp ?? {};
+    const netQty = d.net_quantity ?? {};
+
+    c.box_2d = u.box_2d || null;
+    c.image_index = u.image_index ?? null;
     c.extracted = u.found ? u.text : null;
-    if (u.found) {
+
+    const expected = computeExpectedUSP(mrp, netQty);
+    c.math = expected; // Attach math calculation details for UI and reports
+
+    if (expected?.isExempt) {
+      // Proviso to Rule 6(11): not mandatory when MRP equals unit price (e.g. exactly 1kg, 1L, 1 piece)
       c.status = STATUS.PASS;
-      c.findings.push("Unit sale price declared.");
-    } else {
+      c.findings.push(`Net quantity is exactly 1 standard unit (${netQty.value} ${netQty.unit}) — exempt from separate USP declaration under Rule 6(11) proviso (MRP equals unit price).`);
+      if (u.found) {
+        c.findings.push(`Unit sale price is declared on the pack as "${u.text}".`);
+      }
+    } else if (!u.found) {
       c.status = STATUS.REVIEW;
-      c.findings.push("No unit sale price visible. Not required where MRP equals the unit price or for combination/multi-piece packs (2023 amendment) — inspector to confirm.");
+      if (expected) {
+        c.findings.push(`No Unit Sale Price visible on the label. Under Rule 6(11), the calculated statutory unit price is ₹${expected.expectedPrice.toFixed(2)} per ${expected.expectedBaseUnit} (${expected.formula}) — inspector to confirm if package qualifies for multi-pack/bulk exemption or if physical label bears USP.`);
+      } else {
+        c.findings.push("No unit sale price visible. Mandatory under Rule 6(11) for all multi-unit / variable-quantity packages — verify on physical pack.");
+      }
+    } else {
+      // USP declared -> verify arithmetic accuracy and standard unit rules
+      const parsed = parseDeclaredUSP(u.text);
+      let violated = false;
+      let needsReview = false;
+
+      if (!parsed || parsed.price === null) {
+        needsReview = true;
+        c.findings.push(`Unit sale price text "${u.text}" could not be parsed into a numeric value — verify legibility.`);
+      } else if (parsed.isIllegalMultiplier) {
+        // e.g. "per 100g", "per 50ml", "per dozen"
+        violated = true;
+        c.severity = "major";
+        c.findings.push(`Non-compliant base unit: USP is declared per ${parsed.multiplier}${parsed.declaredUnit || "units"} ("${u.text}"). Rule 6(11) strictly requires price per 1 ${expected?.expectedBaseUnit || "base unit"} (packages ${netQty.value <= 1000 ? "≤ 1kg/1L" : "> 1kg/1L"} must use per ${expected?.expectedBaseUnit || "unit"}).`);
+      } else if (expected) {
+        // Check unit match (e.g. per kg when pack is 500g, or per g when pack is 5kg)
+        const decU = norm(parsed.declaredUnit);
+        const expU = norm(expected.expectedBaseUnit);
+        if (decU && decU !== expU && !(decU === "piece" && expU === "n")) {
+          violated = true;
+          c.severity = "major";
+          c.findings.push(`Incorrect base unit: USP declared per "${parsed.declaredUnit}" ("${u.text}"). Rule 6(11) mandates declaration per "${expected.expectedBaseUnit}" for ${netQty.value} ${netQty.unit}.`);
+        }
+
+        // Arithmetic accuracy check
+        const effectivePrice = parsed.price / parsed.multiplier;
+        const diff = Math.abs(effectivePrice - expected.rawPrice);
+        if (diff > 0.05) {
+          violated = true;
+          c.severity = "major";
+          c.findings.push(`USP Math Discrepancy: Label declares "${u.text}" (effective ₹${effectivePrice.toFixed(2)}/${expU}), but the true computed unit price is ₹${expected.expectedPrice.toFixed(2)} per ${expected.expectedBaseUnit} (${expected.formula}) — misleading price declaration under Rule 6(11).`);
+        } else {
+          c.findings.push(`USP correctly calculated and declared: ₹${expected.expectedPrice.toFixed(2)} per ${expected.expectedBaseUnit} (${expected.formula}).`);
+        }
+      } else {
+        c.findings.push(`Unit sale price declared as "${u.text}".`);
+      }
+
+      if (violated) {
+        c.status = STATUS.VIOLATION;
+      } else if (needsReview) {
+        c.status = STATUS.REVIEW;
+      } else {
+        c.status = STATUS.PASS;
+      }
     }
     results.push(c);
   }
@@ -410,6 +646,8 @@ function runRulesEngine(extraction) {
     const c = check("dimensions", G1, "Rule 6(1)(f), Rules 14–17", "Product dimensions",
       "Dimensions must be declared where size is relevant (textiles, foils, containers, size-priced goods).");
     const dim = d.dimensions ?? {};
+    c.box_2d = dim.box_2d || null;
+    c.image_index = dim.image_index ?? null;
     c.extracted = dim.found ? dim.text : null;
     if (dim.found) {
       c.status = STATUS.PASS;
@@ -429,6 +667,8 @@ function runRulesEngine(extraction) {
     const c = check("veg-mark", G1, "Rule 6(8)", "Vegetarian / non-vegetarian origin mark",
       "Cosmetics and toiletries must carry a green dot (vegetarian origin) or red/brown dot (non-vegetarian origin).");
     const v = d.veg_nonveg_mark ?? {};
+    c.box_2d = v.box_2d || null;
+    c.image_index = v.image_index ?? null;
     c.extracted = !v.found ? null
       : v.mark === "green" ? "Green dot (vegetarian origin)"
       : v.mark === "red_brown" ? "Red/brown dot (non-vegetarian origin)"
@@ -497,6 +737,8 @@ function runRulesEngine(extraction) {
     const c = check("sticker", G1, "Rule 6(3)", "Stickers over declarations",
       "No individual sticker may alter or obscure mandatory declarations; a reduced-MRP sticker must not cover the original MRP.");
     const s = d.sticker_over_declaration ?? {};
+    c.box_2d = s.box_2d || null;
+    c.image_index = s.image_index ?? null;
     if (s.present) {
       c.extracted = s.covers_mrp ? "Sticker covering the printed MRP" : "Sticker over mandatory declarations";
       c.status = STATUS.VIOLATION; c.severity = s.covers_mrp ? "critical" : "major";
@@ -515,6 +757,8 @@ function runRulesEngine(extraction) {
     const c = check("gm", G1, "Rule 6(7)", "Genetically modified declaration",
       "Packages containing genetically modified food must bear the letters 'GM'.");
     const gm = d.gm_declaration ?? {};
+    c.box_2d = gm.box_2d || null;
+    c.image_index = gm.image_index ?? null;
     c.extracted = gm.found ? gm.text : null;
     if (gm.found) {
       c.status = STATUS.PASS;
@@ -630,4 +874,11 @@ function tally(results) {
   return counts;
 }
 
-window.LMPCRules = { runRulesEngine, computeVerdict, effectiveStatus, STATUS };
+window.LMPCRules = {
+  runRulesEngine,
+  computeVerdict,
+  effectiveStatus,
+  computeExpectedUSP,
+  parseDeclaredUSP,
+  STATUS,
+};
